@@ -1,0 +1,22 @@
+---
+galaxy_info:
+  author: MASH project contributors
+  company: mash
+  role_name: gluetun
+  namespace: mash
+  description: A fail-closed Gluetun network-namespace owner for a protected Docker service
+  platforms:
+    - name: Debian
+      versions:
+        - all
+    - name: Ubuntu
+      versions:
+        - all
+    - name: ArchLinux
+      versions:
+        - all
+    - name: EL
+      versions:
+        - "7"
+  license: AGPL-3.0-or-later
+  min_ansible_version: "2.1"

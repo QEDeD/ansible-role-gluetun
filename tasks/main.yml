@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+- name: Perform Gluetun installation tasks
+  when: gluetun_enabled | bool
+  tags:
+    - setup-all
+    - setup-gluetun
+    - install-all
+    - install-gluetun
+  block:
+    - name: Validate Gluetun configuration
+      ansible.builtin.include_tasks: "{{ role_path }}/tasks/validate_config.yml"
+
+    - name: Install Gluetun
+      ansible.builtin.include_tasks: "{{ role_path }}/tasks/install.yml"
+
+- name: Perform Gluetun uninstallation tasks
+  when: not gluetun_enabled | bool
+  tags:
+    - setup-all
+    - setup-gluetun
+  block:
+    - name: Uninstall Gluetun
+      ansible.builtin.include_tasks: "{{ role_path }}/tasks/uninstall.yml"

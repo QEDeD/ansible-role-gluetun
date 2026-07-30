@@ -1,0 +1,210 @@
+<!--
+SPDX-FileCopyrightText: 2026 MASH project contributors
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
+# Configuring Gluetun
+
+This role implements a narrow network-namespace owner for one protected
+service. It is not a general Gluetun option passthrough.
+
+## Required configuration
+
+Choose a provider and protocol and provide protocol credentials through native
+secret files:
+
+```yaml
+gluetun_vpn_service_provider: protonvpn
+gluetun_vpn_type: wireguard
+
+# Supply these from encrypted inventory; the examples are intentionally empty.
+gluetun_wireguard_private_key_secret: ""
+gluetun_wireguard_addresses_secret: ""
+```
+
+Alternatively, supply a full WireGuard configuration:
+
+```yaml
+gluetun_wireguard_configuration_secret: ""
+```
+
+Do not combine a full WireGuard configuration with discrete WireGuard secret
+variables. Values in `wg0.conf` take precedence upstream, so the role rejects
+that ambiguous state.
+
+For OpenVPN, the username and password must either both be supplied or both be
+empty:
+
+```yaml
+gluetun_vpn_service_provider: private internet access
+gluetun_vpn_type: openvpn
+gluetun_openvpn_user_secret: ""
+gluetun_openvpn_password_secret: ""
+```
+
+The role writes secrets with mode `0600`, suppresses Ansible logging and diffs
+for secret tasks, and mounts the secret directory read-only at `/run/secrets`.
+The generated environment file contains no secret values.
+
+## Provider selection settings
+
+Non-secret provider settings use a typed mapping:
+
+```yaml
+gluetun_vpn_provider_environment_variables_custom:
+  SERVER_COUNTRIES: Denmark,Sweden
+  WIREGUARD_MTU: "1320"
+```
+
+Only keys listed in
+`gluetun_vpn_provider_environment_variable_names_allowed` are accepted.
+Firewall, DNS, control-server, proxy, command-hook and port-forwarding settings
+cannot be injected through this mapping.
+
+## Protected-service integration
+
+The protected service must:
+
+1. use `--network=container:<gluetun-container-name-or-id>`;
+2. have no own Docker network, additional networks or published ports;
+3. omit Docker options incompatible with container networking, including
+   `--hostname` and `--dns`;
+4. mount `gluetun_companion_resolv_conf_path` read-only at
+   `/etc/resolv.conf`;
+5. require and order itself after the Gluetun systemd unit;
+6. verify the current owner container is healthy before creation;
+7. stop when the owner unit stops and recreate after the owner container ID
+   changes.
+
+The generated resolver contains only:
+
+```text
+nameserver 127.0.0.1
+options ndots:0
+```
+
+This directs the protected service to Gluetun's loopback DNS forwarder. DNS
+cannot fall back to Docker's or the host's resolver.
+
+Configure the protected unit and container identities together:
+
+```yaml
+gluetun_protected_consumers_list:
+  - systemd_service_name: qbittorrent.service
+    container_name: qbittorrent
+```
+
+The Gluetun unit derives its `Wants=` relationships from this list. The
+consumer-side `BindsTo=` and `After=` relationship provides ordering and stop
+coupling, including unexpected owner failure.
+
+## Integrator sequencing
+
+This role runs an isolation gate before changing paths, images, networks or
+units. It queries the Docker daemon for the current full owner ID and each
+configured protected consumer. A consumer is preserved only if it is absent,
+stopped, or its exact network mode is `container:<current-owner-ID>`. Any
+running standalone or stale-owner consumer has both its configured systemd
+unit and named container stopped, and the role proves that it is no longer
+running before proceeding.
+
+Docker query or inspection errors fail the gate; they are never interpreted as
+container absence. This makes fresh migration safe even if later owner setup
+fails, while an idempotent run does not interrupt a consumer already attached
+to the current owner.
+
+For MASH qBittorrent integration, keep normal setup order:
+Gluetun first, then qBittorrent. The qBittorrent role can then require the
+owner to exist and migrate or recreate the consumer against its exact ID.
+
+## Dedicated bridge and Traefik
+
+Gluetun owns one dedicated IPv4 bridge. Do not reuse MASH's common reverse
+proxy network and do not attach unrelated services.
+
+Traefik may be attached as a known peer so a protected Web UI remains
+available for diagnostics while Internet egress is blocked:
+
+```yaml
+gluetun_container_network_known_peer_containers_list:
+  - traefik
+gluetun_firewall_input_ports:
+  - 8080  # qBittorrent Web UI
+```
+
+The Traefik role or playbook integration owns attachment. This role does not
+attach peers during installation. The dedicated bridge must contain only
+Gluetun and explicitly configured proxy peers.
+
+`gluetun_firewall_input_ports` is a deliberate, numeric allowlist for local
+ingress from that bridge. It does not permit Internet egress, VPN-side ingress,
+or access to arbitrary outbound subnets. Configure only the protected
+service's diagnostic port. The role rejects duplicates, ports outside
+`1..65535`, and collisions with Gluetun's DNS, control and health listeners.
+
+On uninstall, the role disconnects only explicitly listed known peers. It
+never force-disconnects unknown endpoints. If an unknown endpoint remains,
+network deletion does not converge and the role retains the network with a
+runtime warning.
+
+## Failure behaviour
+
+After the initial health gate succeeds, an ordinary VPN tunnel loss leaves
+Gluetun's firewall policies in place while Gluetun attempts internal recovery.
+The protected process may continue running and its local Web UI may remain
+reachable, but new non-local Internet traffic is dropped.
+
+The Gluetun firewall is the Internet kill switch. Docker health is a startup
+readiness gate, and systemd `BindsTo=` handles owner-unit lifecycle; neither is
+a substitute for the firewall during an in-process tunnel outage.
+
+The initial firewall-enable path in Gluetun can restore firewall policies to
+`ACCEPT` if setup fails part-way. The role prevents exposure to that path by
+requiring owner health before a protected service starts and by stopping
+protected services before managed owner restart or removal.
+
+Do not run direct out-of-band commands such as:
+
+```text
+docker restart gluetun
+```
+
+Such commands bypass systemd stop propagation and are outside the fail-closed
+guarantee. Use the managed systemd services.
+
+## Deliberate limitations
+
+The initial role does not support:
+
+- IPv6;
+- additional Docker networks;
+- host-published ports;
+- HTTP or Shadowsocks proxies;
+- VPN-side port forwarding;
+- VPN-side firewall input or outbound-subnet exceptions;
+- custom firewall rules;
+- VPN up/down command hooks;
+- arbitrary Docker arguments or mounts;
+- custom control-server authentication or routes;
+- multiple protected services sharing one owner.
+
+These require separate design and runtime evidence rather than generic escape
+hatches.
+
+The guarantee also excludes a compromised Gluetun process with `NET_ADMIN`,
+external firewall flushing, kernel defects and out-of-band Docker lifecycle
+operations.
+
+## Uninstall and retention
+
+Uninstall:
+
+1. stops configured protected services;
+2. stops and removes the namespace owner;
+3. removes rendered environment, resolver and secret copies;
+4. disconnects only configured known network peers;
+5. removes the bridge only when no endpoints remain;
+6. retains non-empty Gluetun state under `gluetun_data_path`.
+
+The role never recursively deletes retained state or protected-service data.

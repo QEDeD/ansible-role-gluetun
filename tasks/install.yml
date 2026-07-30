@@ -1,0 +1,357 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+- name: Query the current Gluetun owner container
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container ls --all --no-trunc --quiet
+      --filter name=^/{{ gluetun_identifier | regex_escape }}$
+  register: gluetun_existing_owner_container_query_result
+  changed_when: false
+
+- name: Validate the current Gluetun owner container query
+  ansible.builtin.assert:
+    that:
+      - gluetun_existing_owner_container_query_result.stdout_lines | length <= 1
+    fail_msg: The Gluetun owner container query returned an ambiguous result.
+
+- name: Inspect the current Gluetun owner container
+  when: gluetun_existing_owner_container_query_result.stdout_lines | length == 1
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container inspect {{ gluetun_identifier }}
+  register: gluetun_existing_owner_container_inspect_result
+  changed_when: false
+
+- name: Record the current Gluetun owner container ID
+  ansible.builtin.set_fact:
+    gluetun_existing_owner_container_id: >-
+      {{
+        (
+          gluetun_existing_owner_container_inspect_result.stdout
+          | from_json
+          | first
+        ).Id
+        if gluetun_existing_owner_container_query_result.stdout_lines | length == 1
+        else ''
+      }}
+
+- name: Query configured protected Gluetun consumers
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container ls --all --no-trunc --quiet
+      --filter name=^/{{ item.container_name | regex_escape }}$
+  loop: "{{ gluetun_protected_consumers_list }}"
+  loop_control:
+    label: "{{ item.container_name }}"
+  register: gluetun_protected_consumer_query_results
+  changed_when: false
+
+- name: Validate configured protected-consumer queries
+  ansible.builtin.assert:
+    that:
+      - item.stdout_lines | length <= 1
+    fail_msg: >-
+      The query for protected consumer `{{ item.item.container_name }}`
+      returned an ambiguous result.
+  loop: "{{ gluetun_protected_consumer_query_results.results }}"
+  loop_control:
+    label: "{{ item.item.container_name }}"
+
+- name: Record existing protected Gluetun consumers
+  ansible.builtin.set_fact:
+    gluetun_existing_protected_consumers_list: >-
+      {{
+        gluetun_existing_protected_consumers_list | default([])
+        + [item.item]
+      }}
+  when: item.stdout_lines | length == 1
+  loop: "{{ gluetun_protected_consumer_query_results.results }}"
+  loop_control:
+    label: "{{ item.item.container_name }}"
+
+- name: Inspect existing protected Gluetun consumers
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container inspect {{ item.container_name }}
+  loop: "{{ gluetun_existing_protected_consumers_list | default([]) }}"
+  loop_control:
+    label: "{{ item.container_name }}"
+  register: gluetun_protected_consumer_inspect_results
+  changed_when: false
+
+- name: Identify protected Gluetun consumers requiring isolation
+  vars:
+    gluetun_protected_consumer_inspection: "{{ item.stdout | from_json | first }}"
+  ansible.builtin.set_fact:
+    gluetun_protected_consumers_requiring_isolation_list: >-
+      {{
+        gluetun_protected_consumers_requiring_isolation_list | default([])
+        + [item.item]
+      }}
+  when:
+    - gluetun_protected_consumer_inspection.State.Running | bool
+    - >-
+      gluetun_existing_owner_container_id | length == 0
+      or
+      gluetun_protected_consumer_inspection.HostConfig.NetworkMode
+      != 'container:' + gluetun_existing_owner_container_id
+  loop: "{{ gluetun_protected_consumer_inspect_results.results }}"
+  loop_control:
+    label: "{{ item.item.container_name }}"
+
+- name: Check systemd units for protected consumers requiring isolation
+  ansible.builtin.stat:
+    path: >-
+      {{
+        devture_systemd_docker_base_systemd_path
+        + '/'
+        + item.systemd_service_name
+      }}
+  loop: "{{ gluetun_protected_consumers_requiring_isolation_list | default([]) }}"
+  loop_control:
+    label: "{{ item.systemd_service_name }}"
+  register: gluetun_unsafe_protected_consumer_unit_stats
+
+- name: Stop systemd units for protected consumers requiring isolation
+  ansible.builtin.service:
+    name: "{{ item.item.systemd_service_name }}"
+    state: stopped
+  when: item.stat.exists | bool
+  loop: "{{ gluetun_unsafe_protected_consumer_unit_stats.results }}"
+  loop_control:
+    label: "{{ item.item.systemd_service_name }}"
+
+- name: Stop protected consumer containers requiring isolation
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container stop
+      --time {{ gluetun_container_stop_grace_time_seconds }}
+      {{ item.container_name }}
+  loop: "{{ gluetun_protected_consumers_requiring_isolation_list | default([]) }}"
+  loop_control:
+    label: "{{ item.container_name }}"
+  register: gluetun_unsafe_protected_consumer_stop_results
+  changed_when: gluetun_unsafe_protected_consumer_stop_results.rc == 0
+  failed_when: false
+
+- name: Prove isolated protected consumer containers are stopped or absent
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container ls --no-trunc --quiet
+      --filter name=^/{{ item.container_name | regex_escape }}$
+  loop: "{{ gluetun_protected_consumers_requiring_isolation_list | default([]) }}"
+  loop_control:
+    label: "{{ item.container_name }}"
+  register: gluetun_isolated_protected_consumer_query_results
+  changed_when: false
+
+- name: Fail unless protected consumer isolation converged
+  ansible.builtin.assert:
+    that:
+      - item.stdout_lines | length == 0
+    fail_msg: >-
+      Protected consumer `{{ item.item.container_name }}` is still running;
+      refusing to mutate or install the Gluetun owner.
+  loop: "{{ gluetun_isolated_protected_consumer_query_results.results }}"
+  loop_control:
+    label: "{{ item.item.container_name }}"
+
+- name: Ensure Gluetun paths exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    mode: "{{ item.mode }}"
+    owner: "{{ gluetun_uid }}"
+    group: "{{ gluetun_gid }}"
+  loop:
+    - path: "{{ gluetun_base_path }}"
+      mode: "0750"
+    - path: "{{ gluetun_data_path }}"
+      mode: "0750"
+    - path: "{{ gluetun_secrets_path }}"
+      mode: "0700"
+
+- name: Ensure Gluetun non-secret support files are installed
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "{{ item.mode }}"
+    owner: "{{ gluetun_uid }}"
+    group: "{{ gluetun_gid }}"
+  loop:
+    - src: env.j2
+      dest: "{{ gluetun_environment_file_path }}"
+      mode: "0640"
+    - src: companion-resolv.conf.j2
+      dest: "{{ gluetun_companion_resolv_conf_path }}"
+      mode: "0644"
+  register: gluetun_support_files_result
+
+- name: Ensure obsolete Gluetun managed secret files are absent
+  ansible.builtin.file:
+    path: "{{ gluetun_secrets_path }}/{{ item }}"
+    state: absent
+  loop: >-
+    {{
+      gluetun_secret_file_names_known
+      | difference(gluetun_secret_files | map(attribute='name') | list)
+    }}
+  register: gluetun_obsolete_secret_files_result
+  no_log: true
+  diff: false
+
+- name: Ensure Gluetun managed secret files are installed
+  ansible.builtin.copy:
+    content: "{{ item.content }}\n"
+    dest: "{{ gluetun_secrets_path }}/{{ item.name }}"
+    mode: "0600"
+    owner: "{{ gluetun_uid }}"
+    group: "{{ gluetun_gid }}"
+  loop: "{{ gluetun_secret_files }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: gluetun_secret_files_result
+  no_log: true
+  diff: false
+
+- name: Ensure Gluetun container image is pulled via community.docker.docker_image_pull
+  when: devture_systemd_docker_base_container_image_pull_method == 'ansible-module'
+  community.docker.docker_image_pull:
+    name: "{{ gluetun_container_image }}"
+    pull: always
+  register: gluetun_container_image_pull_result_ansible_module
+  retries: "{{ devture_playbook_help_container_retries_count }}"
+  delay: "{{ devture_playbook_help_container_retries_delay }}"
+  until: gluetun_container_image_pull_result_ansible_module is not failed
+
+- name: Ensure Gluetun container image is pulled via ansible.builtin.command
+  when: devture_systemd_docker_base_container_image_pull_method == 'command'
+  ansible.builtin.command:
+    cmd: "{{ devture_systemd_docker_base_host_command_docker }} pull {{ gluetun_container_image }}"
+  register: gluetun_container_image_pull_result_command
+  retries: "{{ devture_playbook_help_container_retries_count }}"
+  delay: "{{ devture_playbook_help_container_retries_delay }}"
+  until: gluetun_container_image_pull_result_command is not failed
+  changed_when: "'Downloaded newer image' in gluetun_container_image_pull_result_command.stdout"
+
+- name: Inspect an existing Gluetun container network
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }} network inspect
+      {{ gluetun_container_network }}
+  register: gluetun_existing_network_inspect_result
+  changed_when: false
+  failed_when: false
+
+- name: Validate an existing Gluetun container network before reuse
+  when: gluetun_existing_network_inspect_result.rc == 0
+  vars:
+    gluetun_existing_network_inspection: "{{ gluetun_existing_network_inspect_result.stdout | from_json | first }}"
+    gluetun_existing_network_endpoint_names: >-
+      {{
+        gluetun_existing_network_inspection.Containers
+        | default({}, true)
+        | dict2items
+        | map(attribute='value.Name')
+        | list
+      }}
+  ansible.builtin.assert:
+    that:
+      - gluetun_existing_network_inspection.Name == gluetun_container_network
+      - gluetun_existing_network_inspection.Driver == 'bridge'
+      - not gluetun_existing_network_inspection.EnableIPv6 | default(false) | bool
+      - >-
+        gluetun_existing_network_endpoint_names
+        | difference(([gluetun_identifier] + gluetun_container_network_known_peer_containers_list) | unique)
+        | length == 0
+    fail_msg: >-
+      The existing Gluetun network is not the dedicated IPv4-only bridge
+      expected by this role, or it has an unknown attached endpoint.
+
+- name: Ensure Gluetun container network is created via community.docker.docker_network
+  when:
+    - gluetun_existing_network_inspect_result.rc != 0
+    - devture_systemd_docker_base_container_network_creation_method == 'ansible-module'
+  community.docker.docker_network:
+    enable_ipv6: false
+    name: "{{ gluetun_container_network }}"
+    driver: bridge
+    driver_options: "{{ devture_systemd_docker_base_container_networks_driver_options }}"
+  register: gluetun_network_creation_result_ansible_module
+
+- name: Ensure Gluetun container network is created via ansible.builtin.command
+  when:
+    - gluetun_existing_network_inspect_result.rc != 0
+    - devture_systemd_docker_base_container_network_creation_method == 'command'
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }} network create
+      {{ devture_systemd_docker_base_container_networks_driver_options_string }}
+      {{ gluetun_container_network }}
+  register: gluetun_network_creation_result_command
+  changed_when: gluetun_network_creation_result_command.rc == 0
+  failed_when: >-
+    gluetun_network_creation_result_command.rc != 0
+    and 'already exists' not in gluetun_network_creation_result_command.stderr
+
+- name: Inspect the installed Gluetun container network
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }} network inspect
+      {{ gluetun_container_network }}
+  register: gluetun_installed_network_inspect_result
+  changed_when: false
+
+- name: Validate the installed Gluetun container network
+  vars:
+    gluetun_installed_network_inspection: "{{ gluetun_installed_network_inspect_result.stdout | from_json | first }}"
+    gluetun_installed_network_endpoint_names: >-
+      {{
+        gluetun_installed_network_inspection.Containers
+        | default({}, true)
+        | dict2items
+        | map(attribute='value.Name')
+        | list
+      }}
+  ansible.builtin.assert:
+    that:
+      - gluetun_installed_network_inspection.Name == gluetun_container_network
+      - gluetun_installed_network_inspection.Driver == 'bridge'
+      - not gluetun_installed_network_inspection.EnableIPv6 | default(false) | bool
+      - >-
+        gluetun_installed_network_endpoint_names
+        | difference(([gluetun_identifier] + gluetun_container_network_known_peer_containers_list) | unique)
+        | length == 0
+    fail_msg: >-
+      The installed Gluetun network is not the dedicated IPv4-only bridge
+      expected by this role, or it has an unknown attached endpoint.
+
+- name: Ensure Gluetun systemd service is present
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/systemd/gluetun.service.j2"
+    dest: "{{ devture_systemd_docker_base_systemd_path }}/{{ gluetun_identifier }}.service"
+    mode: "0644"
+  register: gluetun_systemd_service_result
+
+- name: Determine whether Gluetun needs a restart
+  ansible.builtin.set_fact:
+    gluetun_restart_necessary: >-
+      {{
+        gluetun_support_files_result.changed | default(false)
+        or gluetun_obsolete_secret_files_result.changed | default(false)
+        or gluetun_secret_files_result.changed | default(false)
+        or gluetun_systemd_service_result.changed | default(false)
+        or gluetun_container_image_pull_result_ansible_module.changed | default(false)
+        or gluetun_container_image_pull_result_command.changed | default(false)
+        or gluetun_network_creation_result_ansible_module.changed | default(false)
+        or gluetun_network_creation_result_command.changed | default(false)
+      }}

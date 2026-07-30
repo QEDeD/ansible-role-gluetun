@@ -1,0 +1,263 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+# Project source code URL: https://github.com/passteque/gluetun
+
+gluetun_enabled: true
+
+gluetun_identifier: gluetun
+gluetun_base_path: "/{{ gluetun_identifier }}"
+gluetun_data_path: "{{ gluetun_base_path }}/data"
+gluetun_secrets_path: "{{ gluetun_base_path }}/secrets"
+gluetun_environment_file_path: "{{ gluetun_base_path }}/env"
+gluetun_companion_resolv_conf_path: "{{ gluetun_base_path }}/companion-resolv.conf"
+
+# renovate: datasource=docker depName=qmcgaw/gluetun
+gluetun_version: 3.41.2
+
+# The role intentionally supports only the architectures exercised by MASH.
+gluetun_arch: amd64
+
+gluetun_uid: ""
+gluetun_gid: ""
+
+gluetun_container_image: "{{ gluetun_container_image_registry_prefix }}qmcgaw/gluetun:{{ gluetun_container_image_tag }}"
+gluetun_container_image_tag: "v{{ gluetun_version }}"
+gluetun_container_image_registry_prefix: "{{ gluetun_container_image_registry_prefix_upstream }}"
+gluetun_container_image_registry_prefix_upstream: "{{ gluetun_container_image_registry_prefix_upstream_default }}"
+gluetun_container_image_registry_prefix_upstream_default: docker.io/
+
+gluetun_container_hostname: "{{ gluetun_identifier }}"
+
+# Gluetun owns one dedicated, IPv4-only bridge. Protected containers share
+# Gluetun's network namespace and must not be attached to this or any other
+# network themselves.
+gluetun_container_network: "{{ gluetun_identifier }}"
+gluetun_container_network_ipv6_enabled: false
+gluetun_container_network_deletion_enabled: true
+
+# Containers in this list are known peers, such as Traefik, which another role
+# has attached to gluetun_container_network. During uninstall, only these
+# explicitly named peers may be disconnected. Unknown peers are never forced
+# off the network; their presence causes the network to be retained.
+gluetun_container_network_known_peer_containers_list: []
+
+# Gluetun currently needs its root entrypoint. PUID/PGID are used by Gluetun
+# for generated-file ownership and its OpenVPN subprocess; they are not the
+# Docker container user.
+gluetun_container_user: "0:0"
+gluetun_container_tun_device_path: /dev/net/tun
+
+# This reproduces Docker's documented default capability set, plus NET_ADMIN.
+# It is explicit so Docker cannot silently broaden it. Validation compares it
+# to a role-owned literal, so changing the variable cannot broaden the set.
+# It is not yet a least-privilege claim; reduction requires runtime evidence.
+gluetun_container_capabilities:
+  - AUDIT_WRITE
+  - CHOWN
+  - DAC_OVERRIDE
+  - FOWNER
+  - FSETID
+  - KILL
+  - MKNOD
+  - NET_ADMIN
+  - NET_BIND_SERVICE
+  - NET_RAW
+  - SETFCAP
+  - SETGID
+  - SETPCAP
+  - SETUID
+  - SYS_CHROOT
+
+# VPN provider and protocol are the only required runtime choices.
+gluetun_vpn_service_provider: ""
+gluetun_vpn_type: ""
+
+# Provider settings are typed as a mapping and restricted to the non-secret,
+# non-enforcement keys listed below. Comma-delimited upstream values should be
+# supplied as one string.
+gluetun_vpn_provider_environment_variables_custom: {}
+gluetun_vpn_provider_environment_variable_names_allowed:
+  - FREE_ONLY
+  - ISP
+  - MULTIHOP_ONLY
+  - OPENVPN_AUTH
+  - OPENVPN_CIPHERS
+  - OPENVPN_ENDPOINT_IP
+  - OPENVPN_ENDPOINT_PORT
+  - OPENVPN_MSSFIX
+  - OPENVPN_PROTOCOL
+  - OPENVPN_VERBOSITY
+  - OWNED_ONLY
+  - PORT_FORWARD_ONLY
+  - PREMIUM_ONLY
+  - SECURE_CORE_ONLY
+  - SERVER_CATEGORIES
+  - SERVER_CITIES
+  - SERVER_COUNTRIES
+  - SERVER_HOSTNAMES
+  - SERVER_NAMES
+  - SERVER_NUMBER
+  - SERVER_REGIONS
+  - STREAM_ONLY
+  - TOR_ONLY
+  - WIREGUARD_ENDPOINT_IP
+  - WIREGUARD_ENDPOINT_PORT
+  - WIREGUARD_IMPLEMENTATION
+  - WIREGUARD_MTU
+  - WIREGUARD_PERSISTENT_KEEPALIVE_INTERVAL
+  - WIREGUARD_PUBLIC_KEY
+
+# Native Gluetun secret-file inputs. Values should normally come from an
+# encrypted inventory. The rendered copies never enter the environment file.
+gluetun_openvpn_user_secret: ""
+gluetun_openvpn_password_secret: ""
+gluetun_openvpn_client_certificate_secret: ""
+gluetun_openvpn_client_key_secret: ""
+gluetun_openvpn_encrypted_key_secret: ""
+gluetun_openvpn_key_passphrase_secret: ""
+gluetun_openvpn_custom_configuration_secret: ""
+
+gluetun_wireguard_configuration_secret: ""
+gluetun_wireguard_private_key_secret: ""
+gluetun_wireguard_preshared_key_secret: ""
+gluetun_wireguard_addresses_secret: ""
+
+gluetun_secret_files_auto: >-
+  {{
+    []
+    + ([{'name': 'openvpn_user', 'content': gluetun_openvpn_user_secret}] if gluetun_openvpn_user_secret | length > 0 else [])
+    + ([{'name': 'openvpn_password', 'content': gluetun_openvpn_password_secret}] if gluetun_openvpn_password_secret | length > 0 else [])
+    + ([{'name': 'openvpn_clientcrt', 'content': gluetun_openvpn_client_certificate_secret}] if gluetun_openvpn_client_certificate_secret | length > 0 else [])
+    + ([{'name': 'openvpn_clientkey', 'content': gluetun_openvpn_client_key_secret}] if gluetun_openvpn_client_key_secret | length > 0 else [])
+    + ([{'name': 'openvpn_encrypted_key', 'content': gluetun_openvpn_encrypted_key_secret}] if gluetun_openvpn_encrypted_key_secret | length > 0 else [])
+    + ([{'name': 'openvpn_key_passphrase', 'content': gluetun_openvpn_key_passphrase_secret}] if gluetun_openvpn_key_passphrase_secret | length > 0 else [])
+    + ([{'name': 'openvpn_custom_config', 'content': gluetun_openvpn_custom_configuration_secret}] if gluetun_openvpn_custom_configuration_secret | length > 0 else [])
+    + ([{'name': 'wg0.conf', 'content': gluetun_wireguard_configuration_secret}] if gluetun_wireguard_configuration_secret | length > 0 else [])
+    + ([{'name': 'wireguard_private_key', 'content': gluetun_wireguard_private_key_secret}] if gluetun_wireguard_private_key_secret | length > 0 else [])
+    + ([{'name': 'wireguard_preshared_key', 'content': gluetun_wireguard_preshared_key_secret}] if gluetun_wireguard_preshared_key_secret | length > 0 else [])
+    + ([{'name': 'wireguard_addresses', 'content': gluetun_wireguard_addresses_secret}] if gluetun_wireguard_addresses_secret | length > 0 else [])
+  }}
+gluetun_secret_files: "{{ gluetun_secret_files_auto }}"
+gluetun_secret_file_names_known:
+  - openvpn_clientcrt
+  - openvpn_clientkey
+  - openvpn_custom_config
+  - openvpn_encrypted_key
+  - openvpn_key_passphrase
+  - openvpn_password
+  - openvpn_user
+  - wg0.conf
+  - wireguard_addresses
+  - wireguard_preshared_key
+  - wireguard_private_key
+
+# DNS is always served on the shared namespace's loopback address. Only
+# encrypted upstream transports are accepted.
+gluetun_dns_upstream_resolver_type: dot
+gluetun_dns_upstream_resolvers:
+  - cloudflare
+gluetun_dns_upstream_resolver_names_allowed:
+  - cira family
+  - cira private
+  - cira protected
+  - cleanbrowsing adult
+  - cleanbrowsing family
+  - cleanbrowsing security
+  - cloudflare
+  - cloudflare family
+  - cloudflare security
+  - google
+  - libredns
+  - opendns
+  - quad9
+  - quad9 secured
+  - quad9 unsecured
+  - quadrant
+
+gluetun_health_target_addresses:
+  - cloudflare.com:443
+  - github.com:443
+gluetun_health_icmp_target_ips:
+  - 1.1.1.1
+  - 8.8.8.8
+gluetun_container_health_startup_timeout_seconds: 180
+gluetun_container_health_poll_interval_seconds: 2
+
+# These settings form part of the enforced contract. Validation rejects
+# attempts to weaken them.
+gluetun_firewall_enabled: true
+gluetun_firewall_input_ports: []
+gluetun_firewall_vpn_input_ports: []
+gluetun_firewall_outbound_subnets: []
+gluetun_dns_server_enabled: true
+gluetun_dns_address: 127.0.0.1
+gluetun_dns_keep_nameserver: false
+gluetun_dns_upstream_ipv6_enabled: false
+gluetun_health_restart_vpn_enabled: true
+gluetun_control_server_address: 127.0.0.1:8000
+gluetun_control_server_auth_default_role: "{}"
+gluetun_http_proxy_enabled: false
+gluetun_shadowsocks_enabled: false
+gluetun_vpn_port_forwarding_enabled: false
+gluetun_pprof_enabled: false
+
+gluetun_environment_variables_tz: Etc/UTC
+
+# The owner-side migration gate checks these consumers before any installation
+# mutation. A running consumer is preserved only when it already shares the
+# exact current owner container ID; otherwise its unit and container are
+# stopped and the stopped state is verified.
+gluetun_protected_consumers_list: []
+
+# Derived, role-owned list used by the owner unit's Wants= relationships and
+# uninstall ordering. Configure gluetun_protected_consumers_list, not this.
+gluetun_systemd_dependent_services_list: >-
+  {{
+    gluetun_protected_consumers_list
+    | map(attribute='systemd_service_name')
+    | list
+  }}
+
+gluetun_systemd_required_services_list: "{{ (gluetun_systemd_required_services_list_default + gluetun_systemd_required_services_list_auto + gluetun_systemd_required_services_list_custom) | unique }}"
+gluetun_systemd_required_services_list_default: "{{ [devture_systemd_docker_base_docker_service_name] if devture_systemd_docker_base_docker_service_name else [] }}"
+gluetun_systemd_required_services_list_auto: []
+gluetun_systemd_required_services_list_custom: []
+
+gluetun_systemd_wanted_services_list: "{{ (gluetun_systemd_wanted_services_list_default + gluetun_systemd_wanted_services_list_auto + gluetun_systemd_wanted_services_list_custom) | unique }}"
+gluetun_systemd_wanted_services_list_default: []
+gluetun_systemd_wanted_services_list_auto: []
+gluetun_systemd_wanted_services_list_custom: []
+
+gluetun_container_stop_grace_time_seconds: "{{ [devture_systemd_docker_base_container_stop_grace_time_seconds, 10] | max }}"
+gluetun_container_cleanup_timeout_seconds: "{{ devture_systemd_docker_base_container_cleanup_timeout_seconds }}"
+gluetun_container_cleanup_retry_delay_seconds: "{{ devture_systemd_docker_base_container_cleanup_retry_delay_seconds }}"
+gluetun_systemd_start_timeout_seconds: >-
+  {{
+    (gluetun_container_cleanup_timeout_seconds | int)
+    + (gluetun_container_health_startup_timeout_seconds | int)
+    + 60
+  }}
+
+gluetun_container_cleanup_command: |
+  i=0;
+  while [ "$i" -lt {{ gluetun_container_cleanup_timeout_seconds }} ]; do
+  {{ devture_systemd_docker_base_host_command_docker }} stop -t {{ gluetun_container_stop_grace_time_seconds }} {{ gluetun_identifier }} >/dev/null 2>&1 || true;
+  {{ devture_systemd_docker_base_host_command_docker }} rm -f {{ gluetun_identifier }} >/dev/null 2>&1 || true;
+  if {{ devture_systemd_docker_base_host_command_docker }} container inspect {{ gluetun_identifier }} >/dev/null 2>&1; then
+  i=$((i + 1));
+  sleep {{ gluetun_container_cleanup_retry_delay_seconds }};
+  continue;
+  fi;
+  if {{ devture_systemd_docker_base_host_command_docker }} info >/dev/null 2>&1; then
+  exit 0;
+  fi;
+  echo "Failed to query Docker daemon while cleaning up {{ gluetun_identifier }}" >&2;
+  exit 1;
+  done;
+  echo "Failed to remove stale container {{ gluetun_identifier }} after {{ gluetun_container_cleanup_timeout_seconds }} attempts" >&2;
+  exit 1
+
+gluetun_restart_necessary: false
