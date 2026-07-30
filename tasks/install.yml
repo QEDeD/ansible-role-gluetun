@@ -7,6 +7,11 @@
   ansible.builtin.set_fact:
     gluetun_existing_owner_container_id: ""
     gluetun_existing_owner_container_id_candidate: ""
+    gluetun_existing_owner_container_inspect: {}
+    gluetun_expected_container_image_id: ""
+    gluetun_existing_owner_container_owned: false
+    gluetun_existing_owner_container_contract_valid: false
+    gluetun_existing_owner_requires_replacement: false
     gluetun_existing_owner_is_running: false
     gluetun_existing_owner_sandbox_id: ""
     gluetun_existing_protected_consumers_list: []
@@ -15,6 +20,30 @@
     gluetun_protected_consumers_requiring_isolation_list: []
     gluetun_pre_mutation_ambiguity_messages_list: []
     gluetun_running_namespace_consumers_list: []
+
+- name: Query the pinned local Gluetun image content identity
+  ansible.builtin.command:
+    argv:
+      - "{{ devture_systemd_docker_base_host_command_docker }}"
+      - image
+      - inspect
+      - "--format={{ '{{' }}.Id{{ '}}' }}"
+      - "{{ gluetun_container_image }}"
+  register: gluetun_expected_container_image_query_result
+  changed_when: false
+  failed_when: false
+
+- name: Record the pinned local Gluetun image content identity
+  ansible.builtin.set_fact:
+    gluetun_expected_container_image_id: >-
+      {{ gluetun_expected_container_image_query_result.stdout | trim }}
+  when:
+    - gluetun_expected_container_image_query_result.rc == 0
+    - gluetun_expected_container_image_query_result.stdout_lines | length == 1
+    - >-
+      gluetun_expected_container_image_query_result.stdout
+      | trim
+      is match('^sha256:[a-f0-9]{64}$')
 
 - name: Query the current Gluetun owner container
   ansible.builtin.command:
@@ -62,68 +91,177 @@
     cmd: >-
       {{ devture_systemd_docker_base_host_command_docker }}
       container inspect
-      --format='{% raw %}{{.Id}}|{{.Name}}|{{.State.Running}}|{{.NetworkSettings.SandboxID}}|{{index .Config.Labels "io.mash.gluetun.owner"}}{% endraw %}'
+      --format='{% raw %}{{json .}}{% endraw %}'
       {{ gluetun_existing_owner_container_id_candidate }}
   register: gluetun_existing_owner_container_inspect_result
   changed_when: false
   failed_when: false
+  no_log: true
 
-- name: Record an ambiguous current Gluetun owner inspection
+- name: Validate the current Gluetun owner inspection structure
+  when:
+    - gluetun_existing_owner_container_id_candidate | length > 0
+    - gluetun_existing_owner_container_inspect_result.rc | default(1) == 0
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - -c
+      - |
+        import json
+        import sys
+
+        document = json.load(sys.stdin)
+        assert isinstance(document, dict)
+
+        def require(path, expected_types):
+            value = document
+            for key in path:
+                assert isinstance(value, dict)
+                assert key in value
+                value = value[key]
+            assert isinstance(value, expected_types)
+            return value
+
+        require(("Id",), str)
+        require(("Name",), str)
+        require(("Image",), str)
+        require(("State", "Running"), bool)
+        require(("NetworkSettings", "SandboxID"), str)
+        networks = require(("NetworkSettings", "Networks"), dict)
+        assert all(isinstance(key, str) for key in networks)
+        labels = require(("Config", "Labels"), (dict, type(None)))
+        require(("Config", "Image"), str)
+        entrypoint = require(("Config", "Entrypoint"), (list, type(None)))
+        command = require(("Config", "Cmd"), (list, type(None)))
+        health_test = require(("Config", "Healthcheck", "Test"), list)
+        require(("Config", "Healthcheck", "Interval"), int)
+        require(("Config", "Healthcheck", "Timeout"), int)
+        require(("Config", "Healthcheck", "StartPeriod"), int)
+        require(("Config", "Healthcheck", "Retries"), int)
+        require(("Config", "Hostname"), str)
+        require(("Config", "User"), str)
+        environment = require(("Config", "Env"), (list, type(None)))
+        require(("HostConfig", "NetworkMode"), str)
+        require(("HostConfig", "Privileged"), bool)
+        require(("HostConfig", "AutoRemove"), bool)
+        require(("HostConfig", "RestartPolicy", "Name"), str)
+        require(("HostConfig", "LogConfig", "Type"), str)
+        require(("HostConfig", "PublishAllPorts"), bool)
+        dns = require(("HostConfig", "Dns"), (list, type(None)))
+        cap_drop = require(("HostConfig", "CapDrop"), (list, type(None)))
+        cap_add = require(("HostConfig", "CapAdd"), (list, type(None)))
+        devices = require(("HostConfig", "Devices"), (list, type(None)))
+        sysctls = require(("HostConfig", "Sysctls"), (dict, type(None)))
+        require(("HostConfig", "PortBindings"), (dict, type(None)))
+        mounts = require(("Mounts",), list)
+
+        if labels is not None:
+            assert all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in labels.items()
+            )
+        for values in (
+            entrypoint,
+            command,
+            environment,
+            dns,
+            cap_drop,
+            cap_add,
+        ):
+            if values is not None:
+                assert all(isinstance(value, str) for value in values)
+        assert all(isinstance(value, str) for value in health_test)
+        if sysctls is not None:
+            assert all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in sysctls.items()
+            )
+
+        if devices is not None:
+            for device in devices:
+                assert isinstance(device, dict)
+                assert isinstance(device.get("PathOnHost"), str)
+                assert isinstance(device.get("PathInContainer"), str)
+                assert isinstance(device.get("CgroupPermissions"), str)
+
+        for mount in mounts:
+            assert isinstance(mount, dict)
+            assert isinstance(mount.get("Type"), str)
+            assert isinstance(mount.get("Source"), str)
+            assert isinstance(mount.get("Destination"), str)
+            assert isinstance(mount.get("RW"), bool)
+    stdin: "{{ gluetun_existing_owner_container_inspect_result.stdout }}"
+  register: gluetun_existing_owner_inspect_shape_result
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Parse the current Gluetun owner inspection
+  when:
+    - gluetun_existing_owner_container_id_candidate | length > 0
+    - gluetun_existing_owner_container_inspect_result.rc | default(1) == 0
+    - gluetun_existing_owner_inspect_shape_result.rc | default(1) == 0
+  ansible.builtin.set_fact:
+    gluetun_existing_owner_container_inspect: >-
+      {{
+        gluetun_existing_owner_container_inspect_result.stdout
+        | from_json
+      }}
+  no_log: true
+
+- name: Evaluate the complete current Gluetun owner contract
+  when: gluetun_existing_owner_container_inspect | length > 0
   vars:
-    gluetun_existing_owner_container_inspect_fields: >-
+    gluetun_owner_contract_role_path: "{{ role_path }}"
+  ansible.builtin.include_tasks: >-
+    {{ role_path }}/tasks/evaluate_owner_contract.yml
+
+- name: Evaluate current Gluetun owner role ownership
+  when: gluetun_existing_owner_container_inspect | length > 0
+  vars:
+    gluetun_existing_owner_config: "{{ gluetun_existing_owner_container_inspect.Config | default({}) }}"
+    gluetun_existing_owner_labels: "{{ gluetun_existing_owner_config.Labels | default({}, true) }}"
+  ansible.builtin.set_fact:
+    gluetun_existing_owner_container_owned: >-
       {{
-        gluetun_existing_owner_container_inspect_result.stdout.split('|')
-        if gluetun_existing_owner_container_inspect_result.rc | default(1) == 0
-        else []
+        gluetun_existing_owner_container_inspect.Id
+        == gluetun_existing_owner_container_id_candidate
+        and gluetun_existing_owner_container_inspect.Name
+        == '/' + gluetun_identifier
+        and gluetun_existing_owner_labels.get(gluetun_container_owner_label, '')
+        == gluetun_container_owner_label_value
       }}
-    gluetun_existing_owner_container_inspection_is_valid: >-
-      {{
-        gluetun_existing_owner_container_inspect_result.rc | default(1) == 0
-        and gluetun_existing_owner_container_inspect_fields | length == 5
-        and gluetun_existing_owner_container_inspect_fields[0] == gluetun_existing_owner_container_id_candidate
-        and gluetun_existing_owner_container_inspect_fields[1] == '/' + gluetun_identifier
-        and gluetun_existing_owner_container_inspect_fields[2] in ['true', 'false']
-        and (
-          gluetun_existing_owner_container_inspect_fields[3] == ''
-          or gluetun_existing_owner_container_inspect_fields[3] is match('^[a-f0-9]{64}$')
-        )
-        and
-        (
-          gluetun_existing_owner_container_inspect_fields[4]
-          == gluetun_container_owner_label_value
-        )
-      }}
+
+- name: Record a foreign or ambiguous current Gluetun owner inspection
   ansible.builtin.set_fact:
     gluetun_pre_mutation_ambiguity_messages_list: >-
       {{
         gluetun_pre_mutation_ambiguity_messages_list
-        + ['The exact-ID Gluetun owner inspection was ambiguous.']
+        + [
+          'The exact-ID Gluetun owner is not positively identified by its '
+          + 'role-owned identity label.'
+        ]
       }}
   when:
     - gluetun_existing_owner_container_id_candidate | length > 0
-    - not gluetun_existing_owner_container_inspection_is_valid | bool
+    - not gluetun_existing_owner_container_owned | bool
 
-- name: Record the positively identified current Gluetun owner
-  vars:
-    gluetun_existing_owner_container_inspect_fields: "{{ gluetun_existing_owner_container_inspect_result.stdout.split('|') }}"
+- name: Mark an owned non-conforming Gluetun owner for exact-ID replacement
   ansible.builtin.set_fact:
-    gluetun_existing_owner_container_id: "{{ gluetun_existing_owner_container_inspect_fields[0] }}"
-    gluetun_existing_owner_is_running: "{{ gluetun_existing_owner_container_inspect_fields[2] == 'true' }}"
-    gluetun_existing_owner_sandbox_id: "{{ gluetun_existing_owner_container_inspect_fields[3] }}"
+    gluetun_existing_owner_requires_replacement: true
   when:
     - gluetun_existing_owner_container_id_candidate | length > 0
-    - gluetun_existing_owner_container_inspect_result.rc | default(1) == 0
-    - gluetun_existing_owner_container_inspect_fields | length == 5
-    - gluetun_existing_owner_container_inspect_fields[0] == gluetun_existing_owner_container_id_candidate
-    - gluetun_existing_owner_container_inspect_fields[1] == '/' + gluetun_identifier
-    - gluetun_existing_owner_container_inspect_fields[2] in ['true', 'false']
-    - >-
-      gluetun_existing_owner_container_inspect_fields[3] == ''
-      or
-      gluetun_existing_owner_container_inspect_fields[3] is match('^[a-f0-9]{64}$')
-    - >-
-      gluetun_existing_owner_container_inspect_fields[4]
-      == gluetun_container_owner_label_value
+    - gluetun_existing_owner_container_owned | bool
+    - not gluetun_existing_owner_container_contract_valid | bool
+
+- name: Record the positively owned current Gluetun owner
+  ansible.builtin.set_fact:
+    gluetun_existing_owner_container_id: "{{ gluetun_existing_owner_container_inspect.Id }}"
+    gluetun_existing_owner_is_running: "{{ gluetun_existing_owner_container_inspect.State.Running | bool }}"
+    gluetun_existing_owner_sandbox_id: "{{ gluetun_existing_owner_container_inspect.NetworkSettings.SandboxID | default('') }}"
+  when:
+    - gluetun_existing_owner_container_id_candidate | length > 0
+    - gluetun_existing_owner_container_owned | bool
 
 - name: Query configured protected Gluetun consumers
   ansible.builtin.command:
@@ -295,11 +433,79 @@
       or
       not (gluetun_existing_owner_is_running | bool)
       or
+      not (gluetun_existing_owner_container_contract_valid | bool)
+      or
       gluetun_protected_consumer_inspect_fields[3]
       != 'container:' + gluetun_existing_owner_container_id
   loop: "{{ gluetun_protected_consumer_inspect_results.results }}"
   loop_control:
     label: "{{ item.item.definition.container_name }}"
+
+- name: Check configured protected-consumer unit contracts before isolation
+  ansible.builtin.stat:
+    path: >-
+      {{
+        devture_systemd_docker_base_systemd_path
+        + '/'
+        + item.systemd_service_name
+      }}
+    follow: false
+  loop: "{{ gluetun_protected_consumers_list }}"
+  loop_control:
+    label: "{{ item.systemd_service_name }}"
+  register: gluetun_protected_consumer_unit_stats
+
+- name: Require configured protected-consumer units before isolation
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists | bool
+      - item.stat.isreg | default(false) | bool
+      - not item.stat.islnk | default(false) | bool
+    fail_msg: >-
+      Protected-consumer unit `{{ item.item.systemd_service_name }}` must be a
+      real role-owned unit before Gluetun may stop it or add reverse startup
+      coupling.
+  loop: "{{ gluetun_protected_consumer_unit_stats.results }}"
+  loop_control:
+    label: "{{ item.item.systemd_service_name }}"
+
+- name: Read configured protected-consumer unit contracts before isolation
+  ansible.builtin.slurp:
+    src: >-
+      {{
+        devture_systemd_docker_base_systemd_path
+        + '/'
+        + item.systemd_service_name
+      }}
+  loop: "{{ gluetun_protected_consumers_list }}"
+  loop_control:
+    label: "{{ item.systemd_service_name }}"
+  register: gluetun_protected_consumer_unit_contents
+
+- name: Verify configured protected-consumer unit contracts before isolation
+  vars:
+    gluetun_protected_consumer_unit_lines: >-
+      {{ (item.content | b64decode).splitlines() }}
+  ansible.builtin.assert:
+    that:
+      - >-
+        item.item.systemd_unit_role_marker
+        in gluetun_protected_consumer_unit_lines
+      - "'BindsTo=' + gluetun_identifier + '.service' in gluetun_protected_consumer_unit_lines"
+      - "'After=' + gluetun_identifier + '.service' in gluetun_protected_consumer_unit_lines"
+      - >-
+        '# MASH-NetworkNamespaceOwner=' + gluetun_identifier
+        in gluetun_protected_consumer_unit_lines
+      - >-
+        '# MASH-NetworkNamespaceIdentity=resolved-full-container-id'
+        in gluetun_protected_consumer_unit_lines
+    fail_msg: >-
+      Protected-consumer unit `{{ item.item.systemd_service_name }}` is not the
+      expected role-owned, owner-coupled, exact-ID namespace consumer. It has
+      not been used as a stop target.
+  loop: "{{ gluetun_protected_consumer_unit_contents.results }}"
+  loop_control:
+    label: "{{ item.item.systemd_service_name }}"
 
 - name: Attempt to stop systemd units for protected consumers requiring isolation
   ansible.builtin.service:
@@ -311,28 +517,16 @@
   register: gluetun_unsafe_protected_consumer_unit_stop_results
   failed_when: false
 
-- name: Stop protected consumer containers requiring isolation
-  ansible.builtin.command:
-    cmd: >-
-      {{ devture_systemd_docker_base_host_command_docker }}
-      container stop
-      --time {{ gluetun_container_stop_grace_time_seconds }}
-      {{ item.container_name }}
-  loop: "{{ gluetun_protected_consumers_requiring_isolation_list }}"
-  loop_control:
-    label: "{{ item.container_name }}"
-  register: gluetun_unsafe_protected_consumer_stop_results
-  changed_when: gluetun_unsafe_protected_consumer_stop_results.rc == 0
-  failed_when: false
-
 - name: Stop positively resolved protected-consumer IDs requiring isolation
   when: item.container_name in gluetun_protected_consumer_resolved_ids_by_name
   ansible.builtin.command:
-    cmd: >-
-      {{ devture_systemd_docker_base_host_command_docker }}
-      container stop
-      --time {{ gluetun_container_stop_grace_time_seconds }}
-      {{ gluetun_protected_consumer_resolved_ids_by_name[item.container_name] }}
+    argv:
+      - "{{ devture_systemd_docker_base_host_command_docker }}"
+      - container
+      - stop
+      - --time
+      - "{{ gluetun_container_stop_grace_time_seconds | string }}"
+      - "{{ gluetun_protected_consumer_resolved_ids_by_name[item.container_name] }}"
   loop: "{{ gluetun_protected_consumers_requiring_isolation_list }}"
   loop_control:
     label: "{{ item.container_name }}"
@@ -343,7 +537,7 @@
 - name: Prove isolated protected-consumer systemd units are inactive or absent
   ansible.builtin.command:
     argv:
-      - systemctl
+      - "{{ gluetun_systemd_systemctl_command }}"
       - is-active
       - "{{ item.systemd_service_name }}"
   loop: "{{ gluetun_protected_consumers_requiring_isolation_list }}"
@@ -426,65 +620,6 @@
         gluetun_pre_mutation_ambiguity_messages_list
         | join(' ')
       }}
-
-- name: Check configured protected-consumer unit contracts
-  ansible.builtin.stat:
-    path: >-
-      {{
-        devture_systemd_docker_base_systemd_path
-        + '/'
-        + item.systemd_service_name
-      }}
-  loop: "{{ gluetun_protected_consumers_list }}"
-  loop_control:
-    label: "{{ item.systemd_service_name }}"
-  register: gluetun_protected_consumer_unit_stats
-
-- name: Require configured protected-consumer units before reverse startup coupling
-  ansible.builtin.assert:
-    that:
-      - item.stat.exists | bool
-      - item.stat.isreg | default(false) | bool
-    fail_msg: >-
-      Protected-consumer unit `{{ item.item.systemd_service_name }}` must be
-      rendered before Gluetun can add a reverse Wants= relationship.
-  loop: "{{ gluetun_protected_consumer_unit_stats.results }}"
-  loop_control:
-    label: "{{ item.item.systemd_service_name }}"
-
-- name: Read configured protected-consumer unit contracts
-  ansible.builtin.slurp:
-    src: >-
-      {{
-        devture_systemd_docker_base_systemd_path
-        + '/'
-        + item.systemd_service_name
-      }}
-  loop: "{{ gluetun_protected_consumers_list }}"
-  loop_control:
-    label: "{{ item.systemd_service_name }}"
-  register: gluetun_protected_consumer_unit_contents
-
-- name: Verify configured protected-consumer unit contracts
-  vars:
-    gluetun_protected_consumer_unit_lines: >-
-      {{ (item.content | b64decode).splitlines() }}
-  ansible.builtin.assert:
-    that:
-      - "'BindsTo=' + gluetun_identifier + '.service' in gluetun_protected_consumer_unit_lines"
-      - "'After=' + gluetun_identifier + '.service' in gluetun_protected_consumer_unit_lines"
-      - >-
-        '# MASH-NetworkNamespaceOwner=' + gluetun_identifier
-        in gluetun_protected_consumer_unit_lines
-      - >-
-        '# MASH-NetworkNamespaceIdentity=resolved-full-container-id'
-        in gluetun_protected_consumer_unit_lines
-    fail_msg: >-
-      Protected-consumer unit `{{ item.item.systemd_service_name }}` lacks
-      the required owner dependency or runtime exact-ID contract markers.
-  loop: "{{ gluetun_protected_consumer_unit_contents.results }}"
-  loop_control:
-    label: "{{ item.item.systemd_service_name }}"
 
 - name: Query all running containers for namespace-registry validation
   when: gluetun_existing_owner_container_id | length > 0
@@ -594,6 +729,94 @@
       An unknown or additional running container shares the current Gluetun
       network namespace; refusing to mutate the owner.
 
+- name: Quiesce Gluetun for replacement or persistent recovery
+  when: >-
+    gluetun_existing_owner_requires_replacement | bool
+    or gluetun_existing_quiesce_dropin_owned | default(false) | bool
+  vars:
+    gluetun_quiesce_owner_id: "{{ gluetun_existing_owner_container_id }}"
+    gluetun_quiesce_owner_authorized: "{{ gluetun_existing_owner_container_owned }}"
+  ansible.builtin.include_tasks: "{{ role_path }}/tasks/quiesce.yml"
+
+- name: Stop the captured non-conforming Gluetun owner ID without a unit
+  when:
+    - gluetun_existing_owner_requires_replacement | bool
+    - not gluetun_existing_unit_stat.stat.exists | bool
+  ansible.builtin.command:
+    argv:
+      - "{{ devture_systemd_docker_base_host_command_docker }}"
+      - container
+      - stop
+      - --time
+      - "{{ gluetun_container_stop_grace_time_seconds | string }}"
+      - "{{ gluetun_existing_owner_container_id_candidate }}"
+  register: gluetun_nonconforming_owner_stop_result
+  changed_when: gluetun_nonconforming_owner_stop_result.rc == 0
+  failed_when: false
+
+- name: Remove only the captured non-conforming Gluetun owner ID
+  when: gluetun_existing_owner_requires_replacement | bool
+  ansible.builtin.command:
+    argv:
+      - "{{ devture_systemd_docker_base_host_command_docker }}"
+      - container
+      - rm
+      - --force
+      - "{{ gluetun_existing_owner_container_id_candidate }}"
+  register: gluetun_nonconforming_owner_remove_result
+  changed_when: gluetun_nonconforming_owner_remove_result.rc == 0
+  failed_when: false
+
+- name: Prove the replaced Gluetun owner ID is absent
+  when: gluetun_existing_owner_requires_replacement | bool
+  ansible.builtin.command:
+    argv:
+      - "{{ devture_systemd_docker_base_host_command_docker }}"
+      - container
+      - ls
+      - --all
+      - --no-trunc
+      - --quiet
+      - --filter
+      - "id={{ gluetun_existing_owner_container_id_candidate }}"
+  register: gluetun_replaced_owner_id_query_result
+  changed_when: false
+  failed_when: false
+
+- name: Prove the Gluetun owner name remains absent after replacement cleanup
+  when: gluetun_existing_owner_requires_replacement | bool
+  ansible.builtin.command:
+    argv:
+      - "{{ devture_systemd_docker_base_host_command_docker }}"
+      - container
+      - ls
+      - --all
+      - --no-trunc
+      - --quiet
+      - --filter
+      - "name=^/{{ gluetun_identifier | replace('.', '[.]') }}$"
+  register: gluetun_replaced_owner_name_query_result
+  changed_when: false
+  failed_when: false
+
+- name: Require exact-ID Gluetun owner replacement cleanup to converge
+  when: gluetun_existing_owner_requires_replacement | bool
+  ansible.builtin.assert:
+    that:
+      - gluetun_replaced_owner_id_query_result.rc == 0
+      - gluetun_replaced_owner_id_query_result.stdout | trim | length == 0
+      - gluetun_replaced_owner_name_query_result.rc == 0
+      - gluetun_replaced_owner_name_query_result.stdout | trim | length == 0
+      - >-
+        not gluetun_existing_unit_stat.stat.exists | bool
+        or gluetun_quiesce_applied | default(false) | bool
+    fail_msg: >-
+      The captured non-conforming Gluetun owner was not proven absent. A later
+      same-name replacement was retained and never became a cleanup target.
+
+- name: Revalidate Gluetun application-data paths immediately before mutation
+  ansible.builtin.include_tasks: "{{ role_path }}/tasks/validate_paths.yml"
+
 - name: Ensure Gluetun paths exist
   ansible.builtin.file:
     path: "{{ item.path }}"
@@ -624,6 +847,28 @@
       dest: "{{ gluetun_companion_resolv_conf_path }}"
       mode: "0644"
   register: gluetun_support_files_result
+
+- name: Ensure Gluetun control-server authentication file is installed
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/control-server-auth.toml.j2"
+    dest: "{{ gluetun_control_server_auth_config_path }}"
+    mode: "0600"
+    owner: "{{ gluetun_uid }}"
+    group: "{{ gluetun_gid }}"
+  register: gluetun_control_server_auth_config_result
+  no_log: true
+  diff: false
+
+- name: Ensure the immutable-ID Gluetun container helper is installed
+  vars:
+    gluetun_template_role_path: "{{ role_path }}"
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/gluetun-container-helper.j2"
+    dest: "{{ gluetun_container_helper_path }}"
+    mode: "0755"
+    owner: root
+    group: root
+  register: gluetun_container_helper_result
 
 - name: Ensure obsolete Gluetun managed secret files are absent
   ansible.builtin.file:
@@ -843,11 +1088,25 @@
     mode: "0644"
   register: gluetun_systemd_service_result
 
+- name: Reload systemd with the final Gluetun owner unit
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - daemon-reload
+  changed_when: gluetun_systemd_service_result.changed | bool
+
+- name: Release Gluetun owner quiescing after final unit installation
+  vars:
+    gluetun_quiesce_release_final_unit_expected: true
+  ansible.builtin.include_tasks: "{{ role_path }}/tasks/release_quiesce.yml"
+
 - name: Determine whether Gluetun needs a restart
   ansible.builtin.set_fact:
     gluetun_restart_necessary: >-
       {{
         gluetun_support_files_result.changed | default(false)
+        or gluetun_control_server_auth_config_result.changed | default(false)
+        or gluetun_container_helper_result.changed | default(false)
         or gluetun_obsolete_secret_files_result.changed | default(false)
         or gluetun_secret_files_result.changed | default(false)
         or gluetun_systemd_service_result.changed | default(false)
@@ -855,4 +1114,6 @@
         or gluetun_container_image_pull_result_command.changed | default(false)
         or gluetun_network_creation_result_ansible_module.changed | default(false)
         or gluetun_network_creation_result_command.changed | default(false)
+        or gluetun_existing_owner_requires_replacement | bool
+        or gluetun_quiesce_applied | default(false) | bool
       }}

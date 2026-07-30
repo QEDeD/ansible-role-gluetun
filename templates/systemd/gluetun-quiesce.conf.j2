@@ -1,0 +1,23 @@
+{#
+SPDX-FileCopyrightText: 2026 MASH project contributors
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+#}
+# MASH-Role=Gluetun-quiesce
+[Unit]
+RefuseManualStart=yes
+RefuseManualStop=no
+
+[Service]
+Restart=no
+RestartForceExitStatus=
+RestartPreventExitStatus=
+ExecCondition=
+ExecStartPre=
+ExecStart=
+ExecStart=/bin/false
+ExecStartPost=
+ExecReload=
+ExecStop=
+ExecStop=/bin/true
+ExecStopPost=

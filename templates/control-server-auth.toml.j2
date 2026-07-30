@@ -1,0 +1,18 @@
+{#
+SPDX-FileCopyrightText: 2026 MASH project contributors
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+#}
+
+[[roles]]
+name = "read-only-diagnostics"
+routes = [
+  "GET /v1/version",
+  "GET /v1/vpn/status",
+  "GET /v1/openvpn/status",
+  "GET /v1/dns/status",
+  "GET /v1/updater/status",
+  "GET /v1/publicip/ip",
+]
+auth = "apikey"
+apikey = "{{ gluetun_control_server_auth_api_key_secret }}"

@@ -1,0 +1,481 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+- name: Initialize Gluetun owner quiesce state
+  ansible.builtin.set_fact:
+    gluetun_quiesce_applied: >-
+      {{ gluetun_existing_quiesce_dropin_owned | default(false) | bool }}
+
+- name: Quiesce the existing Gluetun owner unit before lifecycle mutation
+  when: gluetun_existing_unit_stat.stat.exists | bool
+  block:
+    - name: Reattest the immutable Gluetun owner before quiescing
+      when: gluetun_quiesce_owner_id | length > 0
+      ansible.builtin.command:
+        argv:
+          - "{{ devture_systemd_docker_base_host_command_docker }}"
+          - container
+          - inspect
+          - "--format={{ '{{' }}.Id{{ '}}' }}|{{ '{{' }}.Name{{ '}}' }}|{{ '{{' }}index .Config.Labels \"io.mash.gluetun.owner\"{{ '}}' }}"
+          - "{{ gluetun_quiesce_owner_id }}"
+      register: gluetun_quiesce_owner_reattest_result
+      changed_when: false
+      failed_when: false
+
+    - name: Require immutable Gluetun owner identity before quiescing
+      when: gluetun_quiesce_owner_id | length > 0
+      vars:
+        gluetun_quiesce_owner_reattest_fields: >-
+          {{ gluetun_quiesce_owner_reattest_result.stdout.split('|') }}
+      ansible.builtin.assert:
+        that:
+          - gluetun_quiesce_owner_authorized | bool
+          - gluetun_quiesce_owner_reattest_result.rc == 0
+          - gluetun_quiesce_owner_reattest_fields | length == 3
+          - gluetun_quiesce_owner_reattest_fields[0] == gluetun_quiesce_owner_id
+          - gluetun_quiesce_owner_reattest_fields[1] == '/' + gluetun_identifier
+          - gluetun_quiesce_owner_reattest_fields[2] == gluetun_identifier
+        fail_msg: >-
+          The captured Gluetun owner is no longer the exact role-owned
+          immutable ID. No persistent quiesce or container mutation occurred.
+
+    - name: Inspect the persistent Gluetun drop-in directory
+      ansible.builtin.stat:
+        path: "/etc/systemd/system/{{ gluetun_identifier }}.service.d"
+        follow: false
+      register: gluetun_quiesce_dropin_directory_stat
+
+    - name: Require a safe persistent Gluetun drop-in directory
+      when: gluetun_quiesce_dropin_directory_stat.stat.exists | bool
+      ansible.builtin.assert:
+        that:
+          - gluetun_quiesce_dropin_directory_stat.stat.isdir | bool
+          - not gluetun_quiesce_dropin_directory_stat.stat.islnk | default(false) | bool
+        fail_msg: >-
+          The persistent Gluetun drop-in path is not a real directory. No
+          lifecycle mutation has been applied.
+
+    - name: Inspect an existing Gluetun quiesce drop-in
+      ansible.builtin.stat:
+        path: >-
+          /etc/systemd/system/{{ gluetun_identifier }}.service.d/zzzz-mash-fail-closed-quiesce.conf
+        follow: false
+      register: gluetun_existing_quiesce_dropin_stat
+
+    - name: Require an existing Gluetun quiesce drop-in path to be safe
+      when: gluetun_existing_quiesce_dropin_stat.stat.exists | bool
+      ansible.builtin.assert:
+        that:
+          - gluetun_existing_quiesce_dropin_stat.stat.isreg | bool
+          - >-
+            not
+            gluetun_existing_quiesce_dropin_stat.stat.islnk
+            | default(false)
+            | bool
+        fail_msg: >-
+          The reserved Gluetun quiesce drop-in path is not a real file. It has
+          not been read or overwritten.
+
+    - name: Read an existing Gluetun quiesce drop-in
+      when: gluetun_existing_quiesce_dropin_stat.stat.exists | bool
+      ansible.builtin.slurp:
+        src: >-
+          /etc/systemd/system/{{ gluetun_identifier }}.service.d/zzzz-mash-fail-closed-quiesce.conf
+      register: gluetun_existing_quiesce_dropin_content
+
+    - name: Require an existing Gluetun quiesce drop-in to be role-owned
+      when: gluetun_existing_quiesce_dropin_stat.stat.exists | bool
+      ansible.builtin.assert:
+        that:
+          - >-
+            '# MASH-Role=Gluetun-quiesce'
+            in (gluetun_existing_quiesce_dropin_content.content | b64decode)
+        fail_msg: >-
+          The reserved Gluetun quiesce drop-in path is occupied by an
+          unrecognized object. It has not been overwritten.
+
+    - name: Ensure the persistent Gluetun drop-in directory exists
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ gluetun_identifier }}.service.d"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Install the persistent fail-closed Gluetun quiesce drop-in
+      ansible.builtin.template:
+        src: >-
+          {{ role_path }}/templates/systemd/gluetun-quiesce.conf.j2
+        dest: >-
+          /etc/systemd/system/{{ gluetun_identifier }}.service.d/zzzz-mash-fail-closed-quiesce.conf
+        mode: "0644"
+        owner: root
+        group: root
+
+    - name: Reload systemd with the inert Gluetun lifecycle
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - daemon-reload
+      changed_when: true
+
+    - name: Inspect the effective Gluetun load state while quiesced
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - show
+          - --property=LoadState
+          - --value
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_load_state_result
+      changed_when: false
+
+    - name: Inspect the effective Gluetun fragment path while quiesced
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - show
+          - --property=FragmentPath
+          - --value
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_fragment_path_result
+      changed_when: false
+
+    - name: Inspect the effective Gluetun service type while quiesced
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - show
+          - --property=Type
+          - --value
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_service_type_result
+      changed_when: false
+
+    - name: Inspect the effective Gluetun restart policy
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - show
+          - --property=Restart
+          - --value
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_restart_policy_result
+      changed_when: false
+
+    - name: Inspect the effective Gluetun forced restart statuses
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - show
+          - --property=RestartForceExitStatus
+          - --property=RestartPreventExitStatus
+          - --value
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_restart_statuses_result
+      changed_when: false
+
+    - name: Inspect the effective Gluetun manual-start policy
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - show
+          - --property=RefuseManualStart
+          - --value
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_manual_start_policy_result
+      changed_when: false
+
+    - name: Inspect the effective Gluetun manual-stop policy
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - show
+          - --property=RefuseManualStop
+          - --value
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_manual_stop_policy_result
+      changed_when: false
+
+    - name: Inspect the effective Gluetun drop-in paths
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - show
+          - --property=DropInPaths
+          - --value
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_dropin_paths_result
+      changed_when: false
+
+    - name: Inspect the effective Gluetun start command
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - show
+          - --property=ExecStart
+          - --value
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_start_command_result
+      changed_when: false
+
+    - name: Inspect the effective Gluetun stop commands
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - show
+          - --property=ExecStop
+          - --property=ExecStopPost
+          - --value
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_stop_commands_result
+      changed_when: false
+
+    - name: Inspect other effective Gluetun lifecycle commands
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - show
+          - --property=ExecCondition
+          - --property=ExecStartPre
+          - --property=ExecStartPost
+          - --property=ExecReload
+          - --value
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_other_commands_result
+      changed_when: false
+
+    - name: Prove the Gluetun unit is inert before stopping it
+      vars:
+        gluetun_quiesce_unit_path: >-
+          {{ devture_systemd_docker_base_systemd_path }}/{{ gluetun_identifier }}.service
+        gluetun_quiesce_dropin_path: >-
+          /etc/systemd/system/{{ gluetun_identifier }}.service.d/zzzz-mash-fail-closed-quiesce.conf
+      ansible.builtin.assert:
+        that:
+          - gluetun_quiesce_load_state_result.stdout | trim == 'loaded'
+          - >-
+            gluetun_quiesce_fragment_path_result.stdout
+            | trim
+            == gluetun_quiesce_unit_path
+          - gluetun_quiesce_service_type_result.stdout | trim == 'simple'
+          - gluetun_quiesce_restart_policy_result.stdout | trim == 'no'
+          - gluetun_quiesce_restart_statuses_result.stdout | trim | length == 0
+          - >-
+            gluetun_quiesce_manual_start_policy_result.stdout
+            | trim
+            == 'yes'
+          - gluetun_quiesce_manual_stop_policy_result.stdout | trim == 'no'
+          - >-
+            gluetun_quiesce_dropin_paths_result.stdout.split()
+            == [gluetun_quiesce_dropin_path]
+          - >-
+            (
+              gluetun_quiesce_start_command_result.stdout
+              | regex_findall('path=([^ ;}]+)')
+            )
+            == ['/bin/false']
+          - >-
+            (
+              gluetun_quiesce_stop_commands_result.stdout
+              | regex_findall('path=([^ ;}]+)')
+            )
+            == ['/bin/true']
+          - >-
+            (
+              gluetun_quiesce_other_commands_result.stdout
+              | regex_findall('path=([^ ;}]+)')
+              | length
+            )
+            == 0
+        fail_msg: >-
+          The effective Gluetun unit did not adopt the inert start,
+          non-restarting, name-free stop contract. It has not been stopped.
+
+    - name: Stop the quiesced Gluetun unit
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - stop
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_stop_result
+      changed_when: false
+      failed_when: false
+
+    - name: Query the quiesced Gluetun unit state
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - is-active
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_unit_state_result
+      changed_when: false
+      failed_when: false
+
+    - name: Kill only Gluetun unit processes after a failed stop
+      when:
+        - gluetun_quiesce_unit_state_result.stdout | trim not in ['inactive', 'failed', 'unknown']
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - kill
+          - --kill-whom=all
+          - --signal=SIGKILL
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_kill_result
+      changed_when: gluetun_quiesce_kill_result.rc == 0
+      failed_when: false
+
+    - name: Stop Gluetun again after the scoped process kill
+      when:
+        - gluetun_quiesce_unit_state_result.stdout | trim not in ['inactive', 'failed', 'unknown']
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - stop
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_second_stop_result
+      changed_when: false
+      failed_when: false
+
+    - name: Prove the Gluetun unit is inactive after quiescing
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - is-active
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_final_unit_state_result
+      changed_when: false
+      failed_when: false
+
+    - name: Query any queued Gluetun systemd job after quiescing
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - show
+          - --property=Job
+          - --value
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_job_result
+      changed_when: false
+      failed_when: false
+
+    - name: Query Gluetun systemd process identities after quiescing
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - show
+          - --property=MainPID
+          - --property=ControlPID
+          - --value
+          - "{{ gluetun_identifier }}.service"
+      register: gluetun_quiesce_process_ids_result
+      changed_when: false
+      failed_when: false
+
+    - name: Require Gluetun systemd isolation before Docker mutation
+      ansible.builtin.assert:
+        that:
+          - >-
+            gluetun_quiesce_final_unit_state_result.stdout
+            | trim
+            in ['inactive', 'failed', 'unknown']
+          - >-
+            gluetun_quiesce_job_result.rc == 0
+            and gluetun_quiesce_job_result.stdout
+            | trim
+            in ['', '0', '[0 /]']
+          - gluetun_quiesce_process_ids_result.rc == 0
+          - >-
+            gluetun_quiesce_process_ids_result.stdout_lines
+            | reject('equalto', '')
+            | difference(['0'])
+            | length
+            == 0
+        fail_msg: >-
+          Gluetun could not be made inactive after installing an inert,
+          non-restarting persistent unit. Docker state has not been changed.
+
+    - name: Stop only the captured Gluetun owner ID
+      when: gluetun_quiesce_owner_id | length > 0
+      ansible.builtin.command:
+        argv:
+          - "{{ devture_systemd_docker_base_host_command_docker }}"
+          - container
+          - stop
+          - --time
+          - "{{ gluetun_container_stop_grace_time_seconds | string }}"
+          - "{{ gluetun_quiesce_owner_id }}"
+      register: gluetun_quiesce_owner_stop_result
+      changed_when: gluetun_quiesce_owner_stop_result.rc == 0
+      failed_when: false
+
+    - name: Remove only the captured Gluetun owner ID
+      when: gluetun_quiesce_owner_id | length > 0
+      ansible.builtin.command:
+        argv:
+          - "{{ devture_systemd_docker_base_host_command_docker }}"
+          - container
+          - rm
+          - --force
+          - "{{ gluetun_quiesce_owner_id }}"
+      register: gluetun_quiesce_owner_removal_result
+      changed_when: gluetun_quiesce_owner_removal_result.rc == 0
+      failed_when: false
+
+    - name: Prove no exact-name Gluetun owner remains
+      ansible.builtin.command:
+        argv:
+          - "{{ devture_systemd_docker_base_host_command_docker }}"
+          - container
+          - ls
+          - --all
+          - --no-trunc
+          - --filter
+          - "name=^/{{ gluetun_identifier | replace('.', '[.]') }}$"
+          - "--format={{ '{{' }}.ID{{ '}}' }}"
+      register: gluetun_quiesce_running_name_query_result
+      changed_when: false
+      failed_when: false
+
+    - name: Prove the captured Gluetun owner ID is absent
+      when: gluetun_quiesce_owner_id | length > 0
+      ansible.builtin.command:
+        argv:
+          - "{{ devture_systemd_docker_base_host_command_docker }}"
+          - container
+          - ls
+          - --all
+          - --no-trunc
+          - --filter
+          - "id={{ gluetun_quiesce_owner_id }}"
+          - "--format={{ '{{' }}.ID{{ '}}' }}"
+      register: gluetun_quiesce_running_id_query_result
+      changed_when: false
+      failed_when: false
+
+    - name: Require Gluetun Docker isolation after quiescing
+      ansible.builtin.assert:
+        that:
+          - gluetun_quiesce_running_name_query_result.rc == 0
+          - gluetun_quiesce_running_name_query_result.stdout | trim | length == 0
+          - >-
+            gluetun_quiesce_owner_id | length == 0
+            or
+            (
+              gluetun_quiesce_running_id_query_result.rc == 0
+              and
+              gluetun_quiesce_running_id_query_result.stdout
+              | trim
+              | length
+              == 0
+            )
+        fail_msg: >-
+          The Gluetun owner is not proven absent at both its captured immutable
+          ID and stable name. The persistent quiesce is retained for recovery.
+
+    - name: Record successful Gluetun quiescing
+      ansible.builtin.set_fact:
+        gluetun_quiesce_applied: true

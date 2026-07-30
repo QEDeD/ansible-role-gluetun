@@ -1,0 +1,181 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+- name: Validate the Gluetun application-data root lexically
+  ansible.builtin.assert:
+    that:
+      - gluetun_base_path | type_debug == 'str'
+      - gluetun_base_path is match('^/(?!/)[^,\r\n]+$')
+      - "'//' not in gluetun_base_path"
+      - "'.' not in gluetun_base_path.split('/')"
+      - "'..' not in gluetun_base_path.split('/')"
+      - not gluetun_base_path.endswith('/')
+      - gluetun_base_path is not search('[\x00-\x1f\x7f]')
+      - >-
+        gluetun_base_path
+        is not match(
+          '^/(?:$|bin(?:/|$)|boot(?:/|$)|dev(?:/|$)|etc(?:/|$)|home/?$|lib(?:32|64)?(?:/|$)|media/?$|mnt/?$|opt/?$|proc(?:/|$)|root(?:/|$)|run(?:/|$)|sbin(?:/|$)|srv/?$|sys(?:/|$)|tmp/?$|usr(?:/|$)|var/?$|var/(?:cache|log|run|spool|tmp)(?:/|$)|var/lib/?$|var/lib/(?:containers|containerd|docker|podman)(?:/|$))'
+        )
+      - >-
+        gluetun_base_path
+        is not search(
+          '(?:^|/)(?:containerd|crio|docker|podman)[.]sock(?:/|$)'
+        )
+      - gluetun_data_path == gluetun_base_path + '/data'
+      - gluetun_secrets_path == gluetun_base_path + '/secrets'
+      - gluetun_environment_file_path == gluetun_base_path + '/env'
+      - >-
+        gluetun_companion_resolv_conf_path
+        == gluetun_base_path + '/companion-resolv.conf'
+      - >-
+        gluetun_control_server_auth_config_path
+        == gluetun_secrets_path + '/control-server-auth.toml'
+    fail_msg: >-
+      gluetun_base_path must be one canonical, dedicated application-data
+      directory. Symlink-prone spelling, control characters, engine sockets,
+      and broad or host-control trees are not allowed.
+
+- name: Resolve the Gluetun application-data root without following it for mutation
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/readlink
+      - --canonicalize-missing
+      - --
+      - "{{ gluetun_base_path }}"
+  register: gluetun_base_path_resolution_result
+  changed_when: false
+
+- name: Require the Gluetun application-data root to be canonical and symlink-free
+  ansible.builtin.assert:
+    that:
+      - gluetun_base_path_resolution_result.rc == 0
+      - gluetun_base_path_resolution_result.stdout_lines | length == 1
+      - gluetun_base_path_resolution_result.stdout | trim == gluetun_base_path
+    fail_msg: >-
+      gluetun_base_path must not contain or traverse a symbolic link before
+      the role changes ownership or mounts its derived paths.
+
+- name: Inspect the existing Gluetun application-data root without following links
+  ansible.builtin.stat:
+    path: "{{ gluetun_base_path }}"
+    follow: false
+  register: gluetun_base_path_object_stat
+
+- name: Require an existing Gluetun application-data root to be a real directory
+  when: gluetun_base_path_object_stat.stat.exists | bool
+  ansible.builtin.assert:
+    that:
+      - gluetun_base_path_object_stat.stat.isdir | bool
+      - not gluetun_base_path_object_stat.stat.islnk | default(false) | bool
+    fail_msg: >-
+      gluetun_base_path exists but is not a real directory. The role will not
+      mutate or remove anything below it.
+
+- name: Resolve every Gluetun managed child path before mutation
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/readlink
+      - --canonicalize-missing
+      - --
+      - "{{ item.path }}"
+  loop:
+    - name: gluetun_data_path
+      path: "{{ gluetun_data_path }}"
+      kind: directory
+    - name: gluetun_secrets_path
+      path: "{{ gluetun_secrets_path }}"
+      kind: directory
+    - name: gluetun_environment_file_path
+      path: "{{ gluetun_environment_file_path }}"
+      kind: file
+    - name: gluetun_companion_resolv_conf_path
+      path: "{{ gluetun_companion_resolv_conf_path }}"
+      kind: file
+    - name: gluetun_control_server_auth_config_path
+      path: "{{ gluetun_control_server_auth_config_path }}"
+      kind: file
+  loop_control:
+    label: "{{ item.name }}"
+  register: gluetun_managed_child_path_resolution_results
+  changed_when: false
+
+- name: Require every Gluetun managed child path to be canonical
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - item.stdout_lines | length == 1
+      - item.stdout | trim == item.item.path
+    fail_msg: >-
+      {{ item.item.name }} must not contain or traverse a symbolic link before
+      the role changes, mounts, or removes it.
+  loop: "{{ gluetun_managed_child_path_resolution_results.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: Inspect every existing Gluetun managed child object
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    follow: false
+  loop:
+    - name: gluetun_data_path
+      path: "{{ gluetun_data_path }}"
+      kind: directory
+    - name: gluetun_secrets_path
+      path: "{{ gluetun_secrets_path }}"
+      kind: directory
+    - name: gluetun_environment_file_path
+      path: "{{ gluetun_environment_file_path }}"
+      kind: file
+    - name: gluetun_companion_resolv_conf_path
+      path: "{{ gluetun_companion_resolv_conf_path }}"
+      kind: file
+    - name: gluetun_control_server_auth_config_path
+      path: "{{ gluetun_control_server_auth_config_path }}"
+      kind: file
+  loop_control:
+    label: "{{ item.name }}"
+  register: gluetun_managed_child_object_stats
+
+- name: Require every existing Gluetun managed child object to have its expected type
+  when: item.stat.exists | bool
+  ansible.builtin.assert:
+    that:
+      - not item.stat.islnk | default(false) | bool
+      - >-
+        (
+          item.item.kind == 'directory'
+          and item.stat.isdir | default(false) | bool
+        )
+        or
+        (
+          item.item.kind == 'file'
+          and item.stat.isreg | default(false) | bool
+        )
+    fail_msg: >-
+      {{ item.item.name }} exists as a symbolic link or unexpected object type.
+      It will not be changed, mounted, or removed.
+  loop: "{{ gluetun_managed_child_object_stats.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: Inspect existing Gluetun managed secret-file objects
+  ansible.builtin.stat:
+    path: "{{ gluetun_secrets_path }}/{{ item }}"
+    follow: false
+  loop: "{{ gluetun_secret_file_names_known }}"
+  register: gluetun_managed_secret_file_stats
+
+- name: Require existing Gluetun managed secret files to be real files
+  when: item.stat.exists | bool
+  ansible.builtin.assert:
+    that:
+      - item.stat.isreg | default(false) | bool
+      - not item.stat.islnk | default(false) | bool
+    fail_msg: >-
+      Managed Gluetun secret file `{{ item.item }}` is a symbolic link or
+      unexpected object. It will not be overwritten or removed.
+  loop: "{{ gluetun_managed_secret_file_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"

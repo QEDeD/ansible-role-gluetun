@@ -5,7 +5,10 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 #}
 
 [Unit]
+# MASH-Role=Gluetun-namespace-owner
 Description=Gluetun VPN namespace owner ({{ gluetun_identifier }})
+RefuseManualStart=no
+RefuseManualStop=no
 {% for service in gluetun_systemd_required_services_list %}
 Requires={{ service }}
 After={{ service }}
@@ -21,40 +24,21 @@ Wants={{ service }}
 Type=simple
 TimeoutStartSec={{ gluetun_systemd_start_timeout_seconds }}
 Environment="HOME={{ devture_systemd_docker_base_systemd_unit_home_path }}"
-ExecStartPre={{ devture_systemd_docker_base_host_command_sh }} -c '{{ gluetun_container_cleanup_command | trim | replace("\n", " ") }}'
-
-ExecStartPre={{ devture_systemd_docker_base_host_command_docker }} create \
-      --rm \
-      --name={{ gluetun_identifier }} \
-      --hostname={{ gluetun_container_hostname }} \
-      --label={{ gluetun_container_owner_label }}={{ gluetun_container_owner_label_value }} \
-      --log-driver=none \
-      --user={{ gluetun_container_user }} \
-      --cap-drop=ALL \
-      {% for capability in gluetun_container_capabilities %}
-      --cap-add={{ capability }} \
-      {% endfor %}
-      --device={{ gluetun_container_tun_device_path }}:{{ gluetun_container_tun_device_path }}:rwm \
-      --network={{ gluetun_container_network }} \
-      --sysctl=net.ipv6.conf.all.disable_ipv6=1 \
-      --sysctl=net.ipv6.conf.default.disable_ipv6=1 \
-      --env-file={{ gluetun_environment_file_path }} \
-      --mount type=bind,src={{ gluetun_data_path }},dst=/gluetun \
-      --mount type=bind,src={{ gluetun_secrets_path }},dst=/run/secrets,readonly \
-      {{ gluetun_container_image }}
-
-ExecStart={{ devture_systemd_docker_base_host_command_docker }} start --attach {{ gluetun_identifier }}
+RuntimeDirectory={{ gluetun_identifier }}-container
+RuntimeDirectoryMode=0700
+ExecStartPre={{ gluetun_container_helper_path | quote }} cleanup
+ExecStartPre={{ gluetun_container_helper_path | quote }} create
+ExecStart={{ gluetun_container_helper_path | quote }} start
 
 # This command is intentionally not prefixed with "-". A failed or timed-out
 # health gate fails the systemd start job, so protected consumers ordered after
 # this unit cannot start against an unready namespace owner.
-ExecStartPost={{ devture_systemd_docker_base_host_command_sh }} -c 'elapsed=0; while [ "$elapsed" -lt {{ gluetun_container_health_startup_timeout_seconds }} ]; do status=$({{ devture_systemd_docker_base_host_command_docker }} container inspect --format="{% raw %}{{.State.Health.Status}}{% endraw %}" {{ gluetun_identifier }} 2>/dev/null || true); if [ "$status" = healthy ]; then exit 0; fi; sleep {{ gluetun_container_health_poll_interval_seconds }}; elapsed=$((elapsed + {{ gluetun_container_health_poll_interval_seconds }})); done; echo "Gluetun did not become healthy within {{ gluetun_container_health_startup_timeout_seconds }} seconds" >&2; exit 1'
-
-ExecStop=-{{ devture_systemd_docker_base_host_command_docker }} stop -t {{ gluetun_container_stop_grace_time_seconds }} {{ gluetun_identifier }}
+ExecStartPost={{ gluetun_container_helper_path | quote }} health
+ExecStop={{ gluetun_container_helper_path | quote }} stop
 
 # ExecStopPost also runs after a failed ExecStartPost. It guarantees that an
 # unhealthy owner container cannot be left behind after a failed start job.
-ExecStopPost=-{{ devture_systemd_docker_base_host_command_sh }} -c '{{ devture_systemd_docker_base_host_command_docker }} stop -t {{ gluetun_container_stop_grace_time_seconds }} {{ gluetun_identifier }} >/dev/null 2>&1 || true; {{ devture_systemd_docker_base_host_command_docker }} rm -f {{ gluetun_identifier }} >/dev/null 2>&1 || true'
+ExecStopPost={{ gluetun_container_helper_path | quote }} cleanup
 
 Restart=always
 RestartSec=30

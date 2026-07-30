@@ -1,0 +1,347 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+- name: Validate Gluetun lifecycle paths and fixed ownership metadata
+  ansible.builtin.assert:
+    that:
+      - gluetun_identifier is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+      - gluetun_identifier is not match('^[a-f0-9]+$')
+      - >-
+        devture_systemd_docker_base_host_command_docker
+        is match('^/[A-Za-z0-9_./-]+$')
+      - "'//' not in devture_systemd_docker_base_host_command_docker"
+      - >-
+        '..'
+        not in devture_systemd_docker_base_host_command_docker.split('/')
+      - >-
+        devture_systemd_docker_base_systemd_path
+        is match('^/(?:etc|run|usr/lib)/systemd/system$')
+      - gluetun_systemd_systemctl_command is match('^/[A-Za-z0-9_./-]+$')
+      - "'//' not in gluetun_systemd_systemctl_command"
+      - "'.' not in gluetun_systemd_systemctl_command.split('/')"
+      - "'..' not in gluetun_systemd_systemctl_command.split('/')"
+      - gluetun_container_owner_label == 'io.mash.gluetun.owner'
+      - gluetun_container_owner_label_value == gluetun_identifier
+      - >-
+        gluetun_container_fail_closed_contract_label
+        == 'io.mash.gluetun.fail-closed-contract'
+      - gluetun_container_fail_closed_contract_label_value == 'v1'
+      - >-
+        gluetun_container_helper_path
+        ==
+        devture_systemd_docker_base_systemd_path
+        + '/'
+        + gluetun_identifier
+        + '-container-helper'
+    fail_msg: >-
+      Gluetun lifecycle command paths, identifiers, or fixed ownership
+      metadata are unsafe. Nothing has been stopped, overwritten, or removed.
+
+- name: Validate Gluetun lifecycle filesystem paths
+  ansible.builtin.include_tasks: "{{ role_path }}/tasks/validate_paths.yml"
+
+- name: Inspect an existing Gluetun unit before lifecycle mutation
+  ansible.builtin.stat:
+    path: >-
+      {{
+        devture_systemd_docker_base_systemd_path
+        + '/'
+        + gluetun_identifier
+        + '.service'
+      }}
+    follow: false
+  register: gluetun_existing_unit_stat
+
+- name: Require an existing Gluetun unit path to be a safe object
+  when: gluetun_existing_unit_stat.stat.exists | bool
+  ansible.builtin.assert:
+    that:
+      - gluetun_existing_unit_stat.stat.isreg | bool
+      - not gluetun_existing_unit_stat.stat.islnk | default(false) | bool
+    fail_msg: >-
+      The existing Gluetun unit path is not a real file. It has not been read,
+      stopped, overwritten, disabled, or deleted.
+
+- name: Read an existing Gluetun unit before lifecycle mutation
+  when: gluetun_existing_unit_stat.stat.exists | bool
+  ansible.builtin.slurp:
+    src: >-
+      {{
+        devture_systemd_docker_base_systemd_path
+        + '/'
+        + gluetun_identifier
+        + '.service'
+      }}
+  register: gluetun_existing_unit_content
+
+- name: Require an existing Gluetun unit to be role-recognizable
+  when: gluetun_existing_unit_stat.stat.exists | bool
+  vars:
+    gluetun_existing_unit_lines: >-
+      {{ (gluetun_existing_unit_content.content | b64decode).splitlines() }}
+  ansible.builtin.assert:
+    that:
+      - >-
+        '# MASH-Role=Gluetun-namespace-owner'
+        in gluetun_existing_unit_lines
+        or
+        (
+          'Description=Gluetun VPN namespace owner ('
+          + gluetun_identifier
+          + ')'
+          in gluetun_existing_unit_lines
+          and
+          'SyslogIdentifier=' + gluetun_identifier
+          in gluetun_existing_unit_lines
+          and 'Type=simple' in gluetun_existing_unit_lines
+          and 'Restart=always' in gluetun_existing_unit_lines
+          and 'RestartSec=30' in gluetun_existing_unit_lines
+          and 'WantedBy=multi-user.target' in gluetun_existing_unit_lines
+          and
+          (
+            'ExecStart='
+            + devture_systemd_docker_base_host_command_docker
+            + ' start --attach '
+            + gluetun_identifier
+          )
+          in gluetun_existing_unit_lines
+          and
+          (
+            'ExecStop=-'
+            + devture_systemd_docker_base_host_command_docker
+            + ' stop -t '
+            + (gluetun_container_stop_grace_time_seconds | string)
+            + ' '
+            + gluetun_identifier
+          )
+          in gluetun_existing_unit_lines
+          and
+          (
+            gluetun_existing_unit_lines
+            | select(
+              'match',
+              '^ExecStartPre='
+              + devture_systemd_docker_base_host_command_docker
+              + ' create'
+            )
+            | list
+            | length
+          )
+          == 1
+        )
+    fail_msg: >-
+      The existing `{{ gluetun_identifier }}.service` unit is not recognizable
+      as role-owned. It will not be stopped, overwritten, disabled, or deleted.
+
+- name: Record the existing Gluetun unit contract generation
+  ansible.builtin.set_fact:
+    gluetun_existing_unit_has_role_marker: >-
+      {{
+        gluetun_existing_unit_stat.stat.exists | bool
+        and
+        '# MASH-Role=Gluetun-namespace-owner'
+        in (
+          (
+            gluetun_existing_unit_content.content
+            | default('')
+            | b64decode
+          ).splitlines()
+        )
+      }}
+
+- name: Inspect the effective Gluetun load state before lifecycle mutation
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - show
+      - --property=LoadState
+      - --value
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_existing_effective_load_state_result
+  changed_when: false
+
+- name: Inspect the effective Gluetun fragment before lifecycle mutation
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - show
+      - --property=FragmentPath
+      - --value
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_existing_effective_fragment_path_result
+  changed_when: false
+
+- name: Inspect the effective Gluetun active state before lifecycle mutation
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - show
+      - --property=ActiveState
+      - --value
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_existing_effective_active_state_result
+  changed_when: false
+
+- name: Inspect the effective Gluetun job before lifecycle mutation
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - show
+      - --property=Job
+      - --value
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_existing_effective_job_result
+  changed_when: false
+
+- name: Inspect effective Gluetun process identities before lifecycle mutation
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - show
+      - --property=MainPID
+      - --property=ControlPID
+      - --value
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_existing_effective_process_ids_result
+  changed_when: false
+
+- name: Evaluate the Gluetun disk and effective-unit fragment contract
+  vars:
+    gluetun_unit_fragment_contract_disk_exists: >-
+      {{ gluetun_existing_unit_stat.stat.exists | bool }}
+    gluetun_unit_fragment_contract_load_state: >-
+      {{ gluetun_existing_effective_load_state_result.stdout | trim }}
+    gluetun_unit_fragment_contract_fragment_path: >-
+      {{ gluetun_existing_effective_fragment_path_result.stdout | trim }}
+    gluetun_unit_fragment_contract_expected_path: >-
+      {{ devture_systemd_docker_base_systemd_path }}/{{ gluetun_identifier }}.service
+    gluetun_unit_fragment_contract_active_state: >-
+      {{ gluetun_existing_effective_active_state_result.stdout | trim }}
+    gluetun_unit_fragment_contract_job: >-
+      {{ gluetun_existing_effective_job_result.stdout | trim }}
+    gluetun_unit_fragment_contract_process_ids: >-
+      {{ gluetun_existing_effective_process_ids_result.stdout_lines }}
+  ansible.builtin.include_tasks: >-
+    {{ role_path }}/tasks/evaluate_effective_unit_fragment_contract.yml
+
+- name: Require safe Gluetun disk and effective-unit equivalence
+  ansible.builtin.assert:
+    that:
+      - gluetun_effective_unit_fragment_contract_valid | bool
+    fail_msg: >-
+      The intended Gluetun unit file and systemd's effective same-name unit do
+      not have a safe equivalent state. A foreign, transient, stale-active or
+      queued unit may exist; no lifecycle or Docker mutation has occurred.
+
+- name: Inspect the persistent Gluetun quiesce directory
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ gluetun_identifier }}.service.d"
+    follow: false
+  register: gluetun_existing_quiesce_directory_stat
+
+- name: Require an existing Gluetun quiesce directory to be safe
+  when: gluetun_existing_quiesce_directory_stat.stat.exists | bool
+  ansible.builtin.assert:
+    that:
+      - gluetun_existing_quiesce_directory_stat.stat.isdir | bool
+      - >-
+        not
+        gluetun_existing_quiesce_directory_stat.stat.islnk
+        | default(false)
+        | bool
+    fail_msg: >-
+      The persistent Gluetun drop-in path is not a real directory. No
+      lifecycle mutation has been applied.
+
+- name: Inspect an existing persistent Gluetun quiesce drop-in
+  ansible.builtin.stat:
+    path: >-
+      /etc/systemd/system/{{ gluetun_identifier }}.service.d/zzzz-mash-fail-closed-quiesce.conf
+    follow: false
+  register: gluetun_existing_quiesce_dropin_stat
+
+- name: Require an existing Gluetun quiesce drop-in path to be safe
+  when: gluetun_existing_quiesce_dropin_stat.stat.exists | bool
+  ansible.builtin.assert:
+    that:
+      - gluetun_existing_quiesce_dropin_stat.stat.isreg | bool
+      - >-
+        not
+        gluetun_existing_quiesce_dropin_stat.stat.islnk
+        | default(false)
+        | bool
+    fail_msg: >-
+      The reserved Gluetun quiesce drop-in path is not a real file. It has not
+      been read, overwritten, or removed.
+
+- name: Read an existing persistent Gluetun quiesce drop-in
+  when: gluetun_existing_quiesce_dropin_stat.stat.exists | bool
+  ansible.builtin.slurp:
+    src: >-
+      /etc/systemd/system/{{ gluetun_identifier }}.service.d/zzzz-mash-fail-closed-quiesce.conf
+  register: gluetun_existing_quiesce_dropin_content
+
+- name: Require an existing Gluetun quiesce drop-in to be role-owned
+  when: gluetun_existing_quiesce_dropin_stat.stat.exists | bool
+  ansible.builtin.assert:
+    that:
+      - >-
+        '# MASH-Role=Gluetun-quiesce'
+        in (
+          gluetun_existing_quiesce_dropin_content.content
+          | b64decode
+        )
+    fail_msg: >-
+      The reserved Gluetun quiesce drop-in path is occupied by an unrecognized
+      object. It has not been overwritten or removed.
+
+- name: Record an adoptable persistent Gluetun quiesce
+  ansible.builtin.set_fact:
+    gluetun_existing_quiesce_dropin_owned: >-
+      {{ gluetun_existing_quiesce_dropin_stat.stat.exists | bool }}
+
+- name: Inspect an existing Gluetun container helper
+  ansible.builtin.stat:
+    path: "{{ gluetun_container_helper_path }}"
+    follow: false
+  register: gluetun_existing_container_helper_stat
+
+- name: Require an existing Gluetun helper path to be a safe object
+  when: gluetun_existing_container_helper_stat.stat.exists | bool
+  ansible.builtin.assert:
+    that:
+      - gluetun_existing_container_helper_stat.stat.isreg | bool
+      - not gluetun_existing_container_helper_stat.stat.islnk | default(false) | bool
+    fail_msg: >-
+      The existing Gluetun helper path is not a real file. It has not been
+      read, overwritten, or deleted.
+
+- name: Read an existing Gluetun container helper
+  when: gluetun_existing_container_helper_stat.stat.exists | bool
+  ansible.builtin.slurp:
+    src: "{{ gluetun_container_helper_path }}"
+  register: gluetun_existing_container_helper_content
+
+- name: Require an existing Gluetun helper to be role-recognizable
+  when: gluetun_existing_container_helper_stat.stat.exists | bool
+  vars:
+    gluetun_existing_container_helper_text: >-
+      {{ gluetun_existing_container_helper_content.content | b64decode }}
+  ansible.builtin.assert:
+    that:
+      - >-
+        '# MASH-Role=Gluetun-container-helper'
+        in gluetun_existing_container_helper_text
+        or
+        (
+          'owner_state_file="$state_directory/owner-id"'
+          in gluetun_existing_container_helper_text
+          and
+          'owner_identity_has_contract_labels()'
+          in gluetun_existing_container_helper_text
+        )
+    fail_msg: >-
+      The existing Gluetun container helper is not recognizable as role-owned.
+      It will not be overwritten or deleted.

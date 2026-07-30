@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+- name: Record the Gluetun disk and effective-unit fragment contract
+  ansible.builtin.set_fact:
+    gluetun_effective_unit_fragment_contract_valid: >-
+      {{
+        (
+          gluetun_unit_fragment_contract_disk_exists | bool
+          and gluetun_unit_fragment_contract_load_state == 'loaded'
+          and
+          gluetun_unit_fragment_contract_fragment_path
+          == gluetun_unit_fragment_contract_expected_path
+        )
+        or
+        (
+          gluetun_unit_fragment_contract_load_state == 'not-found'
+          and gluetun_unit_fragment_contract_fragment_path == ''
+          and
+          gluetun_unit_fragment_contract_active_state
+          in ['inactive', 'failed']
+          and
+          gluetun_unit_fragment_contract_job
+          in ['', '0', '[0 /]']
+          and
+          gluetun_unit_fragment_contract_process_ids
+          | map('trim')
+          | reject('equalto', '')
+          | difference(['0'])
+          | length
+          == 0
+        )
+      }}

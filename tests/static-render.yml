@@ -1,0 +1,664 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+- name: Render and evaluate the Gluetun static security contract
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../defaults/main.yml
+  vars:
+    gluetun_static_role_path: "{{ playbook_dir }}/.."
+    gluetun_owner_contract_role_path: "{{ gluetun_static_role_path }}"
+    gluetun_template_role_path: "{{ gluetun_static_role_path }}"
+    devture_systemd_docker_base_systemd_path: /etc/systemd/system
+    devture_systemd_docker_base_host_command_docker: /usr/bin/docker
+    devture_systemd_docker_base_systemd_unit_home_path: /root
+    devture_systemd_docker_base_docker_service_name: docker.service
+    devture_systemd_docker_base_container_stop_grace_time_seconds: 10
+    devture_systemd_docker_base_container_cleanup_timeout_seconds: 3
+    devture_systemd_docker_base_container_cleanup_retry_delay_seconds: 1
+    gluetun_static_owner_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    gluetun_static_image_id: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    gluetun_static_sandbox_id: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+    gluetun_expected_container_image_id: "{{ gluetun_static_image_id }}"
+  tasks:
+    - name: Require a unique temporary static-test output path
+      ansible.builtin.assert:
+        that:
+          - gluetun_static_test_output_path is defined
+          - >-
+            gluetun_static_test_output_path
+            is match(
+              '^/tmp/mash-gluetun-static-test[.][A-Za-z0-9]+/rendered$'
+            )
+        fail_msg: >-
+          Pass a unique mktemp-created output directory below
+          /tmp/mash-gluetun-static-test.*.
+
+    - name: Apply explicit static-test role inputs after loading defaults
+      ansible.builtin.set_fact:
+        gluetun_uid: "1000"
+        gluetun_gid: "1000"
+        gluetun_vpn_service_provider: protonvpn
+        gluetun_vpn_type: wireguard
+        gluetun_control_server_auth_api_key_secret: >-
+          static-test-api-key-1234567890
+        gluetun_vpn_provider_environment_variables_custom:
+          SERVER_COUNTRIES: Denmark,Sweden
+          WIREGUARD_MTU: "1320"
+        gluetun_protected_consumers_list:
+          - container_name: qbittorrent
+            systemd_service_name: qbittorrent.service
+            systemd_unit_role_marker: "# MASH-Role=qBittorrent"
+
+    - name: Create the temporary static-test output directory
+      ansible.builtin.file:
+        path: "{{ gluetun_static_test_output_path }}"
+        state: directory
+        mode: "0700"
+
+    - name: Render Gluetun security-contract templates
+      ansible.builtin.template:
+        src: "{{ gluetun_static_role_path }}/templates/{{ item.src }}"
+        dest: "{{ gluetun_static_test_output_path }}/{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - src: env.j2
+          dest: env
+          mode: "0600"
+        - src: control-server-auth.toml.j2
+          dest: control-server-auth.toml
+          mode: "0600"
+        - src: gluetun-container-helper.j2
+          dest: gluetun-container-helper
+          mode: "0700"
+        - src: systemd/gluetun.service.j2
+          dest: gluetun.service
+          mode: "0600"
+        - src: systemd/gluetun-quiesce.conf.j2
+          dest: gluetun-quiesce.conf
+          mode: "0600"
+      loop_control:
+        label: "{{ item.dest }}"
+
+    - name: Build the role-supplied Gluetun environment
+      ansible.builtin.set_fact:
+        gluetun_static_role_environment: >-
+          {{
+            (
+              lookup(
+                'ansible.builtin.template',
+                gluetun_static_role_path + '/templates/env.j2'
+              ).splitlines()
+              | reject('match', '^[ ]*$')
+              | list
+            )
+            +
+            [
+              'HTTP_PROXY=',
+              'HTTPS_PROXY=',
+              'NO_PROXY=',
+              'ALL_PROXY=',
+              'FTP_PROXY=',
+              'http_proxy=',
+              'https_proxy=',
+              'no_proxy=',
+              'all_proxy=',
+              'ftp_proxy='
+            ]
+          }}
+
+    - name: Record role-supplied Gluetun environment keys
+      ansible.builtin.set_fact:
+        gluetun_static_role_environment_keys: >-
+          {{
+            gluetun_static_role_environment
+            | map('regex_replace', '=.*$', '')
+            | list
+          }}
+
+    - name: Model Docker image-default environment overlay by key
+      ansible.builtin.set_fact:
+        gluetun_static_expected_environment: >-
+          {{
+            (
+              gluetun_container_image_default_environment
+              | reject(
+                'match',
+                '^('
+                + (gluetun_static_role_environment_keys | join('|'))
+                + ')='
+              )
+              | list
+            )
+            + gluetun_static_role_environment
+          }}
+
+    - name: Require a unique and realistic final environment model
+      ansible.builtin.assert:
+        that:
+          - gluetun_container_image_default_environment | length == 128
+          - >-
+            gluetun_container_image_default_environment
+            | join('\n')
+            | hash('sha256')
+            ==
+            '364bde63b40f408f4cbbce1021b54adfd73b548dfc50a0369aeaae3e86725364'
+          - >-
+            gluetun_static_expected_environment
+            | map('regex_replace', '=.*$', '')
+            | unique(case_sensitive=true)
+            | length
+            == gluetun_static_expected_environment | length
+          - >-
+            'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+            in gluetun_static_expected_environment
+          - >-
+            'OPENVPN_ENDPOINT_IP=' in gluetun_static_expected_environment
+          - >-
+            'HEALTH_SMALL_CHECK_TYPE=icmp'
+            in gluetun_static_expected_environment
+          - >-
+            'HTTP_CONTROL_SERVER_ADDRESS=:8000'
+            not in gluetun_static_expected_environment
+          - >-
+            'HTTP_CONTROL_SERVER_ADDRESS=127.0.0.1:8000'
+            in gluetun_static_expected_environment
+
+    - name: Build a conforming Gluetun owner inspection
+      ansible.builtin.set_fact:
+        gluetun_static_good_owner_inspect:
+          Id: "{{ gluetun_static_owner_id }}"
+          Name: /gluetun
+          Image: "{{ gluetun_static_image_id }}"
+          State:
+            Running: true
+          NetworkSettings:
+            SandboxID: "{{ gluetun_static_sandbox_id }}"
+            Networks:
+              gluetun: {}
+          Config:
+            Labels:
+              io.mash.gluetun.owner: gluetun
+              io.mash.gluetun.fail-closed-contract: v1
+            Image: "{{ gluetun_container_image }}"
+            Entrypoint:
+              - /gluetun-entrypoint
+            Cmd: []
+            Healthcheck:
+              Test:
+                - CMD-SHELL
+                - /gluetun-entrypoint healthcheck
+              Interval: 5000000000
+              Timeout: 5000000000
+              StartPeriod: 10000000000
+              Retries: 3
+            Hostname: gluetun
+            User: "0:0"
+            Env: "{{ gluetun_static_expected_environment }}"
+          HostConfig:
+            NetworkMode: gluetun
+            Privileged: false
+            AutoRemove: true
+            RestartPolicy:
+              Name: "no"
+            LogConfig:
+              Type: none
+            PublishAllPorts: false
+            Dns:
+              - 127.0.0.1
+            CapDrop:
+              - ALL
+            CapAdd: "{{ gluetun_container_capabilities }}"
+            Devices:
+              - PathOnHost: /dev/net/tun
+                PathInContainer: /dev/net/tun
+                CgroupPermissions: rwm
+            Sysctls:
+              net.ipv6.conf.all.disable_ipv6: "1"
+              net.ipv6.conf.default.disable_ipv6: "1"
+            PortBindings: {}
+          Mounts:
+            - Type: bind
+              Source: /gluetun/data
+              Destination: /gluetun
+              RW: true
+            - Type: bind
+              Source: /gluetun/secrets
+              Destination: /run/secrets
+              RW: false
+
+    - name: Evaluate effective-unit fragment safety fixtures
+      ansible.builtin.include_tasks: >-
+        {{ gluetun_static_role_path }}/tests/evaluate-effective-unit-fragment-fixture.yml
+      loop:
+        - name: loaded intended fragment
+          disk_exists: true
+          load_state: loaded
+          fragment_path: /etc/systemd/system/gluetun.service
+          expected_path: /etc/systemd/system/gluetun.service
+          active_state: active
+          job: "17"
+          process_ids:
+            - "4321"
+            - "0"
+          expected_valid: true
+        - name: inert not-found state with no disk fragment
+          disk_exists: false
+          load_state: not-found
+          fragment_path: ""
+          expected_path: /etc/systemd/system/gluetun.service
+          active_state: inactive
+          job: "0"
+          process_ids:
+            - "0"
+            - "0"
+          expected_valid: true
+        - name: inert not-found state before controlled reload
+          disk_exists: true
+          load_state: not-found
+          fragment_path: ""
+          expected_path: /etc/systemd/system/gluetun.service
+          active_state: inactive
+          job: "[0 /]"
+          process_ids:
+            - "0"
+            - "0"
+          expected_valid: true
+        - name: loaded vendor fragment
+          disk_exists: false
+          load_state: loaded
+          fragment_path: /usr/lib/systemd/system/gluetun.service
+          expected_path: /etc/systemd/system/gluetun.service
+          active_state: active
+          job: "0"
+          process_ids:
+            - "4321"
+            - "0"
+          expected_valid: false
+        - name: disk role unit shadowed by a loaded vendor fragment
+          disk_exists: true
+          load_state: loaded
+          fragment_path: /usr/lib/systemd/system/gluetun.service
+          expected_path: /etc/systemd/system/gluetun.service
+          active_state: active
+          job: "0"
+          process_ids:
+            - "4321"
+            - "0"
+          expected_valid: false
+        - name: cached deleted fragment
+          disk_exists: false
+          load_state: loaded
+          fragment_path: /etc/systemd/system/gluetun.service
+          expected_path: /etc/systemd/system/gluetun.service
+          active_state: active
+          job: "0"
+          process_ids:
+            - "4321"
+            - "0"
+          expected_valid: false
+        - name: stale-active not-found unit
+          disk_exists: false
+          load_state: not-found
+          fragment_path: ""
+          expected_path: /etc/systemd/system/gluetun.service
+          active_state: active
+          job: "0"
+          process_ids:
+            - "4321"
+            - "0"
+          expected_valid: false
+        - name: queued not-found unit
+          disk_exists: false
+          load_state: not-found
+          fragment_path: ""
+          expected_path: /etc/systemd/system/gluetun.service
+          active_state: inactive
+          job: "23"
+          process_ids:
+            - "0"
+            - "0"
+          expected_valid: false
+        - name: inactive not-found unit retaining a process
+          disk_exists: false
+          load_state: not-found
+          fragment_path: ""
+          expected_path: /etc/systemd/system/gluetun.service
+          active_state: inactive
+          job: "0"
+          process_ids:
+            - "4321"
+            - "0"
+          expected_valid: false
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Build good and bad owner-contract fixtures
+      ansible.builtin.set_fact:
+        gluetun_static_owner_contract_fixtures:
+          - name: conforming owner
+            expected: true
+            inspect: "{{ gluetun_static_good_owner_inspect }}"
+          - name: unexpected firewall environment
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'Config': {
+                        'Env': (
+                          gluetun_static_expected_environment
+                          | reject(
+                              'match',
+                              '^FIREWALL_OUTBOUND_SUBNETS='
+                            )
+                          | list
+                        )
+                        + ['FIREWALL_OUTBOUND_SUBNETS=0.0.0.0/0']
+                      }
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: inherited FTP proxy
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'Config': {
+                        'Env': (
+                          gluetun_static_expected_environment
+                          | reject('equalto', 'FTP_PROXY=')
+                          | list
+                        )
+                        + ['FTP_PROXY=http://proxy.invalid']
+                      }
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: unoverridden image control listener
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'Config': {
+                        'Env': (
+                          gluetun_static_expected_environment
+                          | reject(
+                              'match',
+                              '^HTTP_CONTROL_SERVER_ADDRESS='
+                            )
+                          | list
+                        )
+                        + ['HTTP_CONTROL_SERVER_ADDRESS=:8000']
+                      }
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: unoverridden image HTTP proxy default
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'Config': {
+                        'Env': (
+                          gluetun_static_expected_environment
+                          | reject('match', '^HTTPPROXY=')
+                          | list
+                        )
+                        + ['HTTPPROXY=']
+                      }
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: unexpected sensitive environment key
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'Config': {
+                        'Env': gluetun_static_expected_environment
+                        + ['VPN_UNRECOGNIZED_ESCAPE=on']
+                      }
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: duplicate effective environment key
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'Config': {
+                        'Env': gluetun_static_expected_environment
+                        + ['VPN_INTERFACE=eth0']
+                      }
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: wrong fail-closed contract label
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'Config': {
+                        'Labels': {
+                          'io.mash.gluetun.fail-closed-contract': 'v0'
+                        }
+                      }
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: weakened health command
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'Config': {
+                        'Healthcheck': {
+                          'Test': ['CMD-SHELL', '/bin/true']
+                        }
+                      }
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: privileged owner
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {'HostConfig': {'Privileged': true}},
+                    recursive=true
+                  )
+              }}
+          - name: published control port
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'HostConfig': {
+                        'PortBindings': {
+                          '8000/tcp': [
+                            {
+                              'HostIp': '0.0.0.0',
+                              'HostPort': '8000'
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: broadened owner capability
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'HostConfig': {
+                        'CapAdd': gluetun_container_capabilities
+                        + ['SYS_ADMIN']
+                      }
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: wrong TUN device
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'HostConfig': {
+                        'Devices': [
+                          {
+                            'PathOnHost': '/dev/null',
+                            'PathInContainer': '/dev/net/tun',
+                            'CgroupPermissions': 'rwm'
+                          }
+                        ]
+                      }
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: enabled container IPv6
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'HostConfig': {
+                        'Sysctls': {
+                          'net.ipv6.conf.all.disable_ipv6': '0',
+                          'net.ipv6.conf.default.disable_ipv6': '0'
+                        }
+                      }
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: writable secret mount
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'Mounts': [
+                        {
+                          'Type': 'bind',
+                          'Source': '/gluetun/data',
+                          'Destination': '/gluetun',
+                          'RW': true
+                        },
+                        {
+                          'Type': 'bind',
+                          'Source': '/gluetun/secrets',
+                          'Destination': '/run/secrets',
+                          'RW': true
+                        }
+                      ]
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: external Docker DNS
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {'HostConfig': {'Dns': ['1.1.1.1']}},
+                    recursive=true
+                  )
+              }}
+          - name: unexpected container user
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {'Config': {'User': '1000:1000'}},
+                    recursive=true
+                  )
+              }}
+          - name: mismatched pinned image content
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'Image':
+                      'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: additional owner network
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {
+                      'NetworkSettings': {
+                        'Networks': {
+                          'gluetun': {},
+                          'unexpected': {}
+                        }
+                      }
+                    },
+                    recursive=true
+                  )
+              }}
+          - name: host network mode
+            expected: false
+            inspect: >-
+              {{
+                gluetun_static_good_owner_inspect
+                | combine(
+                    {'HostConfig': {'NetworkMode': 'host'}},
+                    recursive=true
+                  )
+              }}
+
+    - name: Evaluate Gluetun owner-contract fixtures
+      ansible.builtin.include_tasks: evaluate-owner-contract-fixture.yml
+      loop: "{{ gluetun_static_owner_contract_fixtures }}"
+      loop_control:
+        loop_var: gluetun_static_owner_contract_fixture
+        label: "{{ gluetun_static_owner_contract_fixture.name }}"

@@ -1,0 +1,215 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+- name: Record the complete current Gluetun owner contract evaluation
+  vars:
+    gluetun_existing_owner_host_config: "{{ gluetun_existing_owner_container_inspect.HostConfig | default({}) }}"
+    gluetun_existing_owner_config: "{{ gluetun_existing_owner_container_inspect.Config | default({}) }}"
+    gluetun_existing_owner_labels: "{{ gluetun_existing_owner_config.Labels | default({}, true) }}"
+    gluetun_existing_owner_devices: "{{ gluetun_existing_owner_host_config.Devices | default([], true) }}"
+    gluetun_existing_owner_sysctls: "{{ gluetun_existing_owner_host_config.Sysctls | default({}, true) }}"
+    gluetun_existing_owner_mounts: "{{ gluetun_existing_owner_container_inspect.Mounts | default([], true) }}"
+    gluetun_existing_owner_environment: "{{ gluetun_existing_owner_config.Env | default([], true) }}"
+    gluetun_existing_owner_role_environment: >-
+      {{
+        (
+          lookup(
+            'ansible.builtin.template',
+            gluetun_owner_contract_role_path + '/templates/env.j2'
+          ).splitlines()
+          | reject('match', '^[ ]*$')
+          | list
+        )
+        +
+        [
+          'HTTP_PROXY=',
+          'HTTPS_PROXY=',
+          'NO_PROXY=',
+          'ALL_PROXY=',
+          'FTP_PROXY=',
+          'http_proxy=',
+          'https_proxy=',
+          'no_proxy=',
+          'all_proxy=',
+          'ftp_proxy='
+        ]
+      }}
+    gluetun_existing_owner_role_environment_keys: >-
+      {{
+        gluetun_existing_owner_role_environment
+        | map('regex_replace', '=.*$', '')
+        | list
+      }}
+    gluetun_existing_owner_expected_environment: >-
+      {{
+        (
+          gluetun_container_image_default_environment
+          | reject(
+            'match',
+            '^('
+            + (
+              gluetun_existing_owner_role_environment_keys
+              | join('|')
+            )
+            + ')='
+          )
+          | list
+        )
+        + gluetun_existing_owner_role_environment
+      }}
+    gluetun_existing_owner_expected_environment_keys: >-
+      {{
+        gluetun_existing_owner_expected_environment
+        | map('regex_replace', '=.*$', '')
+        | list
+      }}
+    gluetun_existing_owner_actual_environment_keys: >-
+      {{
+        gluetun_existing_owner_environment
+        | map('regex_replace', '=.*$', '')
+        | list
+      }}
+    gluetun_existing_owner_unexpected_sensitive_environment: >-
+      {{
+        gluetun_existing_owner_environment
+        | select(
+          'match',
+          '^(?:VPN_|OPENVPN_|WIREGUARD_|FIREWALL_|DNS_|HEALTH_|HTTP_CONTROL_SERVER_|HTTPPROXY=|SHADOWSOCKS=|PPROF_|UPDATER_|PUID=|PGID=|TZ=|SERVER_|ISP=|OWNED_ONLY=|STREAM_ONLY=|FREE_ONLY=|SECURE_CORE_ONLY=|TOR_ONLY=|MULTIHOP_ONLY=|PREMIUM_ONLY=|PORT_FORWARD_ONLY=|(?:HTTP|HTTPS|NO|ALL|FTP)_PROXY=|(?:http|https|no|all|ftp)_proxy=)'
+        )
+        | list
+        | difference(gluetun_existing_owner_expected_environment)
+      }}
+  ansible.builtin.set_fact:
+    gluetun_existing_owner_container_contract_valid: >-
+      {{
+        gluetun_existing_owner_container_inspect.Id
+        == gluetun_existing_owner_container_id_candidate
+        and gluetun_existing_owner_container_inspect.Name
+        == '/' + gluetun_identifier
+        and gluetun_existing_owner_container_inspect.State.Running
+        in [true, false]
+        and
+        (
+          gluetun_existing_owner_container_inspect.NetworkSettings.SandboxID
+          | default('')
+          == ''
+          or
+          gluetun_existing_owner_container_inspect.NetworkSettings.SandboxID
+          is match('^[a-f0-9]{64}$')
+        )
+        and gluetun_existing_owner_labels.get(gluetun_container_owner_label, '')
+        == gluetun_container_owner_label_value
+        and
+        gluetun_existing_owner_labels.get(
+          gluetun_container_fail_closed_contract_label,
+          ''
+        )
+        == gluetun_container_fail_closed_contract_label_value
+        and gluetun_existing_owner_config.Image == gluetun_container_image
+        and
+        gluetun_expected_container_image_id | length > 0
+        and gluetun_existing_owner_container_inspect.Image
+        == gluetun_expected_container_image_id
+        and
+        (gluetun_existing_owner_config.Entrypoint | default([], true))
+        == ['/gluetun-entrypoint']
+        and (gluetun_existing_owner_config.Cmd | default([], true)) == []
+        and
+        gluetun_existing_owner_config.Healthcheck.Test
+        == ['CMD-SHELL', '/gluetun-entrypoint healthcheck']
+        and gluetun_existing_owner_config.Healthcheck.Interval == 5000000000
+        and gluetun_existing_owner_config.Healthcheck.Timeout == 5000000000
+        and gluetun_existing_owner_config.Healthcheck.StartPeriod == 10000000000
+        and gluetun_existing_owner_config.Healthcheck.Retries == 3
+        and gluetun_existing_owner_config.Hostname == gluetun_container_hostname
+        and gluetun_existing_owner_config.User == gluetun_container_user
+        and gluetun_existing_owner_host_config.NetworkMode
+        == gluetun_container_network
+        and not (gluetun_existing_owner_host_config.Privileged | bool)
+        and (gluetun_existing_owner_host_config.AutoRemove | bool)
+        and gluetun_existing_owner_host_config.RestartPolicy.Name == 'no'
+        and gluetun_existing_owner_host_config.LogConfig.Type == 'none'
+        and not (gluetun_existing_owner_host_config.PublishAllPorts | bool)
+        and
+        (gluetun_existing_owner_host_config.Dns | default([], true))
+        == ['127.0.0.1']
+        and
+        gluetun_existing_owner_expected_environment_keys
+        | unique(case_sensitive=true)
+        | length
+        == gluetun_existing_owner_expected_environment | length
+        and
+        gluetun_existing_owner_actual_environment_keys
+        | unique(case_sensitive=true)
+        | length
+        == gluetun_existing_owner_environment | length
+        and
+        (gluetun_existing_owner_environment | sort)
+        ==
+        (gluetun_existing_owner_expected_environment | sort)
+        and
+        gluetun_existing_owner_unexpected_sensitive_environment | length == 0
+        and
+        (gluetun_existing_owner_host_config.CapDrop | default([], true))
+        == ['ALL']
+        and
+        (
+          gluetun_existing_owner_host_config.CapAdd
+          | default([], true)
+          | sort
+        )
+        == (gluetun_container_capabilities | sort)
+        and gluetun_existing_owner_devices | length == 1
+        and gluetun_existing_owner_devices[0].PathOnHost
+        == gluetun_container_tun_device_path
+        and gluetun_existing_owner_devices[0].PathInContainer
+        == gluetun_container_tun_device_path
+        and gluetun_existing_owner_devices[0].CgroupPermissions == 'rwm'
+        and
+        gluetun_existing_owner_sysctls
+        ==
+        {
+          'net.ipv6.conf.all.disable_ipv6': '1',
+          'net.ipv6.conf.default.disable_ipv6': '1'
+        }
+        and gluetun_existing_owner_mounts | length == 2
+        and
+        (
+          gluetun_existing_owner_mounts
+          | selectattr('Type', 'equalto', 'bind')
+          | selectattr('Source', 'equalto', gluetun_data_path)
+          | selectattr('Destination', 'equalto', '/gluetun')
+          | selectattr('RW', 'equalto', true)
+          | list
+          | length
+        )
+        == 1
+        and
+        (
+          gluetun_existing_owner_mounts
+          | selectattr('Type', 'equalto', 'bind')
+          | selectattr('Source', 'equalto', gluetun_secrets_path)
+          | selectattr('Destination', 'equalto', '/run/secrets')
+          | selectattr('RW', 'equalto', false)
+          | list
+          | length
+        )
+        == 1
+        and
+        (
+          gluetun_existing_owner_host_config.PortBindings
+          | default({}, true)
+          | length
+        )
+        == 0
+        and
+        (
+          gluetun_existing_owner_container_inspect.NetworkSettings.Networks
+          | default({}, true)
+          | list
+          | sort
+        )
+        == [gluetun_container_network]
+      }}

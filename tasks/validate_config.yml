@@ -20,6 +20,7 @@
     - gluetun_control_server_auth_config_secret
     - gluetun_environment_variables_additional_variables
     - gluetun_firewall_custom_post_rules
+    - gluetun_openvpn_custom_configuration_secret
     - gluetun_vpn_down_command
     - gluetun_vpn_up_command
 
@@ -38,6 +39,10 @@
     - gluetun_container_network
     - gluetun_vpn_service_provider
     - gluetun_vpn_type
+    - gluetun_control_server_auth_api_key_secret
+
+- name: Validate Gluetun application-data paths
+  ansible.builtin.include_tasks: "{{ role_path }}/tasks/validate_paths.yml"
 
 - name: Validate Gluetun scalar and collection settings
   ansible.builtin.assert:
@@ -51,18 +56,36 @@
       - gluetun_secrets_path == gluetun_base_path + '/secrets'
       - gluetun_environment_file_path == gluetun_base_path + '/env'
       - gluetun_companion_resolv_conf_path == gluetun_base_path + '/companion-resolv.conf'
+      - gluetun_control_server_auth_config_path == gluetun_secrets_path + '/control-server-auth.toml'
+      - gluetun_control_server_auth_config_container_path == '/run/secrets/control-server-auth.toml'
+      - >-
+        gluetun_container_helper_path
+        ==
+        devture_systemd_docker_base_systemd_path
+        + '/'
+        + gluetun_identifier
+        + '-container-helper'
       - gluetun_uid | string is match('^[0-9]+$')
       - gluetun_gid | string is match('^[0-9]+$')
       - gluetun_arch in ['amd64', 'arm64']
       - gluetun_version == '3.41.2'
       - gluetun_container_image_tag == 'v3.41.2'
-      - gluetun_container_image is match('^(?:[a-zA-Z0-9._:-]+/)*qmcgaw/gluetun:v3[.]41[.]2$')
+      - >-
+        gluetun_container_image_digest
+        == 'sha256:280809bc6900ed06d6529ad246499103efb31fd80c6327cbfaf90de0b17c3a99'
+      - >-
+        gluetun_container_image
+        is match(
+          '^(?:[a-zA-Z0-9._:-]+/)*qmcgaw/gluetun:v3[.]41[.]2@sha256:280809bc6900ed06d6529ad246499103efb31fd80c6327cbfaf90de0b17c3a99$'
+        )
       - gluetun_container_user == '0:0'
       - gluetun_container_network is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
       - gluetun_container_network is not match('^[a-f0-9]+$')
       - gluetun_container_hostname is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
       - gluetun_container_owner_label == 'io.mash.gluetun.owner'
       - gluetun_container_owner_label_value == gluetun_identifier
+      - gluetun_container_fail_closed_contract_label == 'io.mash.gluetun.fail-closed-contract'
+      - gluetun_container_fail_closed_contract_label_value == 'v1'
       - gluetun_container_network_owner_label == 'io.mash.gluetun.owner'
       - gluetun_container_network_owner_label_value == gluetun_identifier
       - not gluetun_container_network_ipv6_enabled | bool
@@ -76,6 +99,7 @@
       - gluetun_systemd_dependent_services_list | type_debug == 'list'
       - gluetun_container_network_known_peer_containers_list | type_debug == 'list'
       - gluetun_container_capabilities | type_debug == 'list'
+      - gluetun_container_image_default_environment | type_debug == 'list'
       - gluetun_secret_files | type_debug == 'list'
       - gluetun_systemd_required_services_list | type_debug == 'list'
       - gluetun_systemd_wanted_services_list | type_debug == 'list'
@@ -121,6 +145,19 @@
       - >-
         gluetun_container_network_known_peer_containers_list | unique | length
         == gluetun_container_network_known_peer_containers_list | length
+      - gluetun_container_image_default_environment | length == 128
+      - >-
+        gluetun_container_image_default_environment
+        | map('regex_replace', '=.*$', '')
+        | unique
+        | length
+        == gluetun_container_image_default_environment | length
+      - >-
+        gluetun_container_image_default_environment
+        | join('\n')
+        | hash('sha256')
+        ==
+        '364bde63b40f408f4cbbce1021b54adfd73b548dfc50a0369aeaae3e86725364'
       - >-
         gluetun_systemd_required_services_list
         | intersect(gluetun_systemd_dependent_services_list)
@@ -135,19 +172,50 @@
         | length == 0
     fail_msg: One or more Gluetun settings has an invalid type, value, or format.
 
+- name: Validate the pinned Gluetun image environment entries
+  ansible.builtin.assert:
+    that:
+      - item | type_debug == 'str'
+      - item is match('^[A-Z][A-Z0-9_]*=.*$')
+    fail_msg: >-
+      The pinned Gluetun image environment contract contains a malformed entry.
+  loop: "{{ gluetun_container_image_default_environment }}"
+  no_log: true
+
+- name: Validate the Gluetun control-server API key
+  ansible.builtin.assert:
+    that:
+      - gluetun_control_server_auth_api_key_secret | type_debug == 'str'
+      - gluetun_control_server_auth_api_key_secret is match('^[A-Za-z0-9_-]{20,128}$')
+    fail_msg: >-
+      gluetun_control_server_auth_api_key_secret must be a 20- to 128-character
+      API key containing only letters, digits, underscores, and hyphens.
+  no_log: true
+
 - name: Validate Gluetun protected-consumer definitions
   ansible.builtin.assert:
     that:
       - item | type_debug == 'dict'
-      - item.keys() | sort == ['container_name', 'systemd_service_name']
+      - >-
+        item.keys() | sort
+        ==
+        [
+          'container_name',
+          'systemd_service_name',
+          'systemd_unit_role_marker'
+        ]
       - item.container_name is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
       - item.container_name is not match('^[a-f0-9]+$')
       - item.container_name != gluetun_identifier
       - item.systemd_service_name is match('^[a-zA-Z0-9][a-zA-Z0-9_.@-]*\.service$')
       - item.systemd_service_name != gluetun_identifier + '.service'
+      - >-
+        item.systemd_unit_role_marker
+        is match('^# MASH-Role=[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
     fail_msg: >-
-      Each protected consumer must contain only a safe container_name and
-      systemd_service_name, and cannot name the Gluetun owner itself.
+      Each protected consumer must contain only a safe container_name,
+      systemd_service_name, and systemd_unit_role_marker, and cannot name the
+      Gluetun owner itself.
   loop: "{{ gluetun_protected_consumers_list }}"
 
 - name: Validate unique Gluetun protected-consumer identities
@@ -182,6 +250,7 @@
       - gluetun_health_restart_vpn_enabled | bool
       - gluetun_control_server_address == '127.0.0.1:8000'
       - gluetun_control_server_auth_default_role == '{}'
+      - gluetun_control_server_auth_config_container_path == '/run/secrets/control-server-auth.toml'
       - not gluetun_http_proxy_enabled | bool
       - not gluetun_shadowsocks_enabled | bool
       - not gluetun_vpn_port_forwarding_enabled | bool
@@ -369,7 +438,6 @@
       - gluetun_openvpn_client_key_secret | length == 0
       - gluetun_openvpn_encrypted_key_secret | length == 0
       - gluetun_openvpn_key_passphrase_secret | length == 0
-      - gluetun_openvpn_custom_configuration_secret | length == 0
     fail_msg: OpenVPN secrets cannot be used when gluetun_vpn_type is wireguard.
   when: gluetun_vpn_type == 'wireguard'
   no_log: true

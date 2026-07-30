@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+- name: Load the owner-contract fixture
+  ansible.builtin.set_fact:
+    gluetun_existing_owner_container_id_candidate: >-
+      {{ gluetun_static_owner_id }}
+    gluetun_existing_owner_container_inspect: >-
+      {{ gluetun_static_owner_contract_fixture.inspect }}
+    gluetun_existing_owner_container_contract_valid: false
+
+- name: Evaluate the owner-contract fixture with the production policy
+  ansible.builtin.include_tasks: >-
+    {{ gluetun_static_role_path }}/tasks/evaluate_owner_contract.yml
+
+- name: Require the expected owner-contract fixture result
+  ansible.builtin.assert:
+    that:
+      - >-
+        gluetun_existing_owner_container_contract_valid | bool
+        ==
+        gluetun_static_owner_contract_fixture.expected | bool
+    fail_msg: >-
+      Owner-contract fixture `{{ gluetun_static_owner_contract_fixture.name }}`
+      did not produce the expected policy decision.

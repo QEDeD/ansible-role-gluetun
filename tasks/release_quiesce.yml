@@ -1,0 +1,176 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+- name: Inspect the persistent Gluetun quiesce before releasing it
+  when: gluetun_quiesce_applied | default(false) | bool
+  ansible.builtin.stat:
+    path: >-
+      /etc/systemd/system/{{ gluetun_identifier }}.service.d/zzzz-mash-fail-closed-quiesce.conf
+    follow: false
+  register: gluetun_quiesce_release_dropin_stat
+
+- name: Require a real persistent Gluetun quiesce before releasing it
+  when: gluetun_quiesce_applied | default(false) | bool
+  ansible.builtin.assert:
+    that:
+      - gluetun_quiesce_release_dropin_stat.stat.exists | bool
+      - gluetun_quiesce_release_dropin_stat.stat.isreg | bool
+      - >-
+        not
+        gluetun_quiesce_release_dropin_stat.stat.islnk
+        | default(false)
+        | bool
+    fail_msg: >-
+      The persistent Gluetun quiesce disappeared or changed object type before
+      release. It has not been removed.
+
+- name: Read the persistent Gluetun quiesce before releasing it
+  when: gluetun_quiesce_applied | default(false) | bool
+  ansible.builtin.slurp:
+    src: >-
+      /etc/systemd/system/{{ gluetun_identifier }}.service.d/zzzz-mash-fail-closed-quiesce.conf
+  register: gluetun_quiesce_release_dropin_content
+
+- name: Require role ownership of the Gluetun quiesce before releasing it
+  when: gluetun_quiesce_applied | default(false) | bool
+  ansible.builtin.assert:
+    that:
+      - >-
+        '# MASH-Role=Gluetun-quiesce'
+        in (
+          gluetun_quiesce_release_dropin_content.content
+          | b64decode
+        )
+    fail_msg: >-
+      The persistent Gluetun quiesce is no longer role-recognizable. It has not
+      been removed.
+
+- name: Release the persistent Gluetun quiesce transactionally
+  when: >-
+    gluetun_quiesce_applied | default(false) | bool
+    or
+    gluetun_quiesce_release_final_unit_expected
+    | default(false)
+    | bool
+  block:
+    - name: Verify no shadow Gluetun unit precedes uninstall guard release
+      when:
+        not
+        gluetun_quiesce_release_final_unit_expected
+        | default(false)
+        | bool
+      ansible.builtin.include_tasks: >-
+        {{ role_path }}/tasks/verify_guarded_absent_unit.yml
+
+    - name: Remove only the persistent Gluetun quiesce drop-in
+      when: gluetun_quiesce_applied | default(false) | bool
+      ansible.builtin.file:
+        path: >-
+          /etc/systemd/system/{{ gluetun_identifier }}.service.d/zzzz-mash-fail-closed-quiesce.conf
+        state: absent
+      register: gluetun_quiesce_dropin_removal_result
+
+    - name: Reload systemd after releasing Gluetun quiescing
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - daemon-reload
+      changed_when: >-
+        gluetun_quiesce_dropin_removal_result.changed
+        | default(false)
+        | bool
+
+    - name: Verify the effective finalized Gluetun unit
+      when:
+        gluetun_quiesce_release_final_unit_expected
+        | default(false)
+        | bool
+      ansible.builtin.include_tasks: >-
+        {{ role_path }}/tasks/verify_final_unit.yml
+
+    - name: Verify the Gluetun unit is absent after uninstall release
+      when:
+        not
+        gluetun_quiesce_release_final_unit_expected
+        | default(false)
+        | bool
+      ansible.builtin.include_tasks: >-
+        {{ role_path }}/tasks/verify_absent_unit.yml
+
+    - name: Reset Gluetun start-limit and failed state after finalization
+      when:
+        gluetun_quiesce_release_final_unit_expected
+        | default(false)
+        | bool
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - reset-failed
+          - "{{ gluetun_identifier }}.service"
+      changed_when: false
+
+  rescue:
+    - name: Inspect the persistent Gluetun drop-in directory before restoration
+      ansible.builtin.stat:
+        path: "/etc/systemd/system/{{ gluetun_identifier }}.service.d"
+        follow: false
+      register: gluetun_quiesce_restore_directory_stat
+
+    - name: Require a safe Gluetun drop-in directory before restoration
+      when: gluetun_quiesce_restore_directory_stat.stat.exists | bool
+      ansible.builtin.assert:
+        that:
+          - gluetun_quiesce_restore_directory_stat.stat.isdir | bool
+          - >-
+            not
+            gluetun_quiesce_restore_directory_stat.stat.islnk
+            | default(false)
+            | bool
+        fail_msg: >-
+          The persistent Gluetun drop-in directory became unsafe while
+          restoring the fail-closed guard.
+
+    - name: Ensure the persistent Gluetun drop-in directory for restoration
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ gluetun_identifier }}.service.d"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Restore the persistent Gluetun release marker after release failure
+      ansible.builtin.template:
+        src: "{{ role_path }}/templates/systemd/gluetun-quiesce.conf.j2"
+        dest: >-
+          /etc/systemd/system/{{ gluetun_identifier }}.service.d/zzzz-mash-fail-closed-quiesce.conf
+        mode: "0644"
+        owner: root
+        group: root
+
+    - name: Reload systemd after restoring the Gluetun release marker
+      ansible.builtin.command:
+        argv:
+          - "{{ gluetun_systemd_systemctl_command }}"
+          - daemon-reload
+      changed_when: true
+
+    - name: Verify restored Gluetun quiescing when a final unit was expected
+      when:
+        gluetun_quiesce_release_final_unit_expected
+        | default(false)
+        | bool
+      ansible.builtin.include_tasks: >-
+        {{ role_path }}/tasks/verify_quiesce_unit.yml
+
+    - name: Report the failed Gluetun quiesce release
+      ansible.builtin.fail:
+        msg: >-
+          The persistent Gluetun quiesce could not be released and verified
+          safely. The role restored its owned drop-in for a deterministic
+          retry. Installation reattests it as a fail-closed guard. After
+          intentional unit removal it may be only a durable release marker;
+          if another same-name fragment emerged, it is retained conservatively
+          without adopting that fragment. Rerun after diagnosing the effective
+          unit state.

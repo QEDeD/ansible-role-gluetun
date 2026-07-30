@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+- name: Inspect the removed Gluetun role unit before guard release
+  ansible.builtin.stat:
+    path: >-
+      {{ devture_systemd_docker_base_systemd_path }}/{{ gluetun_identifier }}.service
+    follow: false
+  register: gluetun_guarded_absent_unit_stat
+
+- name: Inspect the guarded-absent Gluetun load state
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - show
+      - --property=LoadState
+      - --value
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_guarded_absent_load_state_result
+  changed_when: false
+
+- name: Inspect the guarded-absent Gluetun fragment path
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - show
+      - --property=FragmentPath
+      - --value
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_guarded_absent_fragment_path_result
+  changed_when: false
+
+- name: Inspect the guarded-absent Gluetun drop-in paths
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - show
+      - --property=DropInPaths
+      - --value
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_guarded_absent_dropin_paths_result
+  changed_when: false
+
+- name: Prove no shadow Gluetun unit would be exposed by guard release
+  vars:
+    gluetun_guarded_absent_expected_dropin_path: >-
+      /etc/systemd/system/{{ gluetun_identifier }}.service.d/zzzz-mash-fail-closed-quiesce.conf
+  ansible.builtin.assert:
+    that:
+      - not gluetun_guarded_absent_unit_stat.stat.exists | bool
+      - gluetun_guarded_absent_load_state_result.stdout | trim == 'not-found'
+      - >-
+        gluetun_guarded_absent_fragment_path_result.stdout
+        | trim
+        | length
+        == 0
+      - >-
+        gluetun_guarded_absent_dropin_paths_result.stdout.split()
+        == [gluetun_guarded_absent_expected_dropin_path]
+    fail_msg: >-
+      Removing the role-owned Gluetun unit revealed an effective same-name
+      fragment or an additional effective drop-in. The persistent drop-in is
+      retained as a guard and the foreign policy is not exposed by release.

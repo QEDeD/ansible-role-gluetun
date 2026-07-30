@@ -14,6 +14,9 @@
     - name: Validate Gluetun configuration
       ansible.builtin.include_tasks: "{{ role_path }}/tasks/validate_config.yml"
 
+    - name: Validate Gluetun lifecycle mutation safety
+      ansible.builtin.include_tasks: "{{ role_path }}/tasks/validate_lifecycle.yml"
+
     - name: Install Gluetun
       ansible.builtin.include_tasks: "{{ role_path }}/tasks/install.yml"
 
@@ -23,5 +26,8 @@
     - setup-all
     - setup-gluetun
   block:
+    - name: Validate Gluetun lifecycle cleanup safety
+      ansible.builtin.include_tasks: "{{ role_path }}/tasks/validate_lifecycle.yml"
+
     - name: Uninstall Gluetun
       ansible.builtin.include_tasks: "{{ role_path }}/tasks/uninstall.yml"

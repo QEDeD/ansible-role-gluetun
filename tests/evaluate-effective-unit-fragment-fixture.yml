@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+- name: Load the effective-unit fragment fixture
+  ansible.builtin.set_fact:
+    gluetun_unit_fragment_contract_disk_exists: "{{ item.disk_exists }}"
+    gluetun_unit_fragment_contract_load_state: "{{ item.load_state }}"
+    gluetun_unit_fragment_contract_fragment_path: "{{ item.fragment_path }}"
+    gluetun_unit_fragment_contract_expected_path: "{{ item.expected_path }}"
+    gluetun_unit_fragment_contract_active_state: "{{ item.active_state }}"
+    gluetun_unit_fragment_contract_job: "{{ item.job }}"
+    gluetun_unit_fragment_contract_process_ids: "{{ item.process_ids }}"
+
+- name: Evaluate the effective-unit fragment fixture with production policy
+  ansible.builtin.include_tasks: >-
+    {{ gluetun_static_role_path }}/tasks/evaluate_effective_unit_fragment_contract.yml
+
+- name: Require the expected effective-unit fragment fixture result
+  ansible.builtin.assert:
+    that:
+      - >-
+        gluetun_effective_unit_fragment_contract_valid | bool
+        == item.expected_valid

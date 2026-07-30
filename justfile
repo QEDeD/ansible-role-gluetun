@@ -36,6 +36,10 @@ prek-run-on-staged *args: _ensure_mise_tools_installed
 prek-run-on-all *args: _ensure_mise_tools_installed
     @{{ just_executable() }} --justfile {{ justfile() }} prek run --all-files {{ args }}
 
+# Renders and verifies the local fail-closed security contract without Docker
+test-static:
+    @tests/test-static.sh
+
 # Installs the Git pre-commit hook
 prek-install-git-pre-commit-hook: _ensure_mise_tools_installed
     #!/usr/bin/env sh

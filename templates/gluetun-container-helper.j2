@@ -1,0 +1,342 @@
+#!/bin/sh
+# MASH-Role=Gluetun-container-helper
+{#
+SPDX-FileCopyrightText: 2026 MASH project contributors
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+#}
+set -eu
+
+docker_command={{ devture_systemd_docker_base_host_command_docker | quote }}
+owner_name={{ gluetun_identifier | quote }}
+owner_name_filter={{ ('name=^/' ~ (gluetun_identifier | replace('.', '[.]')) ~ '$') | quote }}
+owner_label={{ gluetun_container_owner_label | quote }}
+owner_label_value={{ gluetun_container_owner_label_value | quote }}
+contract_label={{ gluetun_container_fail_closed_contract_label | quote }}
+contract_label_value={{ gluetun_container_fail_closed_contract_label_value | quote }}
+owner_hostname={{ gluetun_container_hostname | quote }}
+owner_user={{ gluetun_container_user | quote }}
+tun_device={{ gluetun_container_tun_device_path | quote }}
+owner_network={{ gluetun_container_network | quote }}
+environment_file={{ gluetun_environment_file_path | quote }}
+data_path={{ gluetun_data_path | quote }}
+secrets_path={{ gluetun_secrets_path | quote }}
+auth_config_path={{ gluetun_control_server_auth_config_path | quote }}
+auth_config_expected_sha256={{ (lookup('ansible.builtin.template', gluetun_template_role_path ~ '/templates/control-server-auth.toml.j2') | hash('sha256')) | quote }}
+auth_config_owner_uid={{ gluetun_uid | string | quote }}
+auth_config_owner_gid={{ gluetun_gid | string | quote }}
+container_image={{ gluetun_container_image | quote }}
+stop_grace_time={{ gluetun_container_stop_grace_time_seconds | string | quote }}
+cleanup_attempts={{ gluetun_container_cleanup_attempts | string | quote }}
+cleanup_retry_delay={{ gluetun_container_cleanup_retry_delay_seconds | string | quote }}
+health_timeout={{ gluetun_container_health_startup_timeout_seconds | string | quote }}
+health_poll_interval={{ gluetun_container_health_poll_interval_seconds | string | quote }}
+state_directory={{ ('/run/' ~ gluetun_identifier ~ '-container') | quote }}
+owner_state_file="$state_directory/owner-id"
+
+is_full_container_id() {
+  candidate_id=$1
+  [ "$(printf '%s' "$candidate_id" | wc -c)" -eq 64 ] || return 1
+  case "$candidate_id" in
+    *[!a-f0-9]*) return 1 ;;
+  esac
+}
+
+discover_exact_owner_id() {
+  identity=$(
+    "$docker_command" container ls --all --no-trunc \
+      --filter "$owner_name_filter" \
+      --format='{% raw %}{{.ID}}|{{.Names}}{% endraw %}'
+  ) || return 1
+
+  candidate_id=${identity%%|*}
+  candidate_name=${identity#*|}
+  [ "$candidate_name" != "$identity" ] || return 1
+  case "$candidate_name" in
+    *'|'*) return 1 ;;
+  esac
+  [ "$candidate_name" = "$owner_name" ] || return 1
+  is_full_container_id "$candidate_id" || return 1
+  printf '%s\n' "$candidate_id"
+}
+
+exact_owner_name_is_absent() {
+  identity=$(
+    "$docker_command" container ls --all --no-trunc \
+      --filter "$owner_name_filter" \
+      --format='{% raw %}{{.ID}}|{{.Names}}{% endraw %}'
+  ) || return 1
+  [ -z "$identity" ]
+}
+
+exact_container_id_is_absent() {
+  expected_id=$1
+  is_full_container_id "$expected_id" || return 1
+  identity=$(
+    "$docker_command" container ls --all --no-trunc \
+      --filter "id=$expected_id" \
+      --format='{% raw %}{{.ID}}{% endraw %}'
+  ) || return 1
+  [ -z "$identity" ]
+}
+
+owner_identity_has_contract_labels() {
+  expected_id=$1
+  identity=$(
+    "$docker_command" container inspect \
+      --format='{% raw %}{{.Id}}|{{.Name}}|{{index .Config.Labels "io.mash.gluetun.owner"}}|{{index .Config.Labels "io.mash.gluetun.fail-closed-contract"}}{% endraw %}' \
+      "$expected_id"
+  ) || return 1
+
+  candidate_id=${identity%%|*}
+  identity_remainder=${identity#*|}
+  [ "$identity_remainder" != "$identity" ] || return 1
+  candidate_name=${identity_remainder%%|*}
+  identity_remainder=${identity_remainder#*|}
+  candidate_owner_label=${identity_remainder%%|*}
+  candidate_contract_label=${identity_remainder#*|}
+  [ "$candidate_contract_label" != "$identity_remainder" ] || return 1
+  case "$candidate_contract_label" in
+    *'|'*) return 1 ;;
+  esac
+
+  [ "$candidate_id" = "$expected_id" ] || return 1
+  [ "$candidate_name" = "/$owner_name" ] || return 1
+  [ "$candidate_owner_label" = "$owner_label_value" ] || return 1
+  [ "$candidate_contract_label" = "$contract_label_value" ] || return 1
+}
+
+remove_owner_id() {
+  candidate_id=$1
+  is_full_container_id "$candidate_id" || return 1
+  attempt=1
+  while [ "$attempt" -le "$cleanup_attempts" ]; do
+    "$docker_command" container stop \
+      --time "$stop_grace_time" "$candidate_id" >/dev/null 2>&1 || true
+    "$docker_command" container rm --force "$candidate_id" >/dev/null 2>&1 || true
+    exact_container_id_is_absent "$candidate_id" && return 0
+    [ "$attempt" -ge "$cleanup_attempts" ] && break
+    sleep "$cleanup_retry_delay"
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+read_owner_id() {
+  [ -f "$owner_state_file" ] || return 1
+  candidate_id=
+  IFS= read -r candidate_id < "$owner_state_file" || return 1
+  is_full_container_id "$candidate_id" || return 1
+  printf '%s\n' "$candidate_id"
+}
+
+write_owner_id() {
+  expected_id=$1
+  temporary_state_file="$owner_state_file.tmp.$$"
+  umask 077
+  printf '%s\n' "$expected_id" > "$temporary_state_file" || return 1
+  mv "$temporary_state_file" "$owner_state_file" || return 1
+}
+
+clear_owner_id() {
+  rm -f "$owner_state_file" "$owner_state_file.tmp."*
+}
+
+auth_config_is_expected() {
+  [ -f "$auth_config_path" ] || return 1
+  [ ! -L "$auth_config_path" ] || return 1
+  auth_config_metadata=$(
+    /usr/bin/stat --format='%a|%u|%g' -- "$auth_config_path"
+  ) || return 1
+  [ "$auth_config_metadata" = "600|$auth_config_owner_uid|$auth_config_owner_gid" ] || return 1
+  auth_config_actual_sha256=$(
+    /usr/bin/sha256sum -- "$auth_config_path"
+  ) || return 1
+  auth_config_actual_sha256=${auth_config_actual_sha256%% *}
+  [ "$auth_config_actual_sha256" = "$auth_config_expected_sha256" ]
+}
+
+cleanup_owner() {
+  saved_owner_id=
+  initial_owner_id=
+  cleanup_status=0
+
+  if [ -f "$owner_state_file" ]; then
+    if ! saved_owner_id=$(read_owner_id); then
+      echo "Cannot validate the remembered Gluetun owner ID" >&2
+      cleanup_status=1
+    elif ! remove_owner_id "$saved_owner_id"; then
+      echo "Cannot remove and prove absence of the remembered Gluetun owner ID" >&2
+      cleanup_status=1
+    fi
+  elif initial_owner_id=$(discover_exact_owner_id); then
+    if ! owner_identity_has_contract_labels "$initial_owner_id"; then
+      echo "Refusing to remove an exact-name container without both Gluetun contract labels" >&2
+      cleanup_status=1
+    elif ! remove_owner_id "$initial_owner_id"; then
+      echo "Cannot remove and prove absence of the initially captured Gluetun owner ID" >&2
+      cleanup_status=1
+    fi
+  elif ! exact_owner_name_is_absent; then
+    echo "Cannot prove the exact Gluetun owner name is absent" >&2
+    cleanup_status=1
+  fi
+
+  if [ -n "$saved_owner_id" ] \
+    && ! exact_container_id_is_absent "$saved_owner_id"; then
+    cleanup_status=1
+  fi
+  if [ -n "$initial_owner_id" ] \
+    && ! exact_container_id_is_absent "$initial_owner_id"; then
+    cleanup_status=1
+  fi
+  if ! exact_owner_name_is_absent; then
+    echo "A replacement claimed the Gluetun owner name during cleanup" >&2
+    cleanup_status=1
+  fi
+  [ "$cleanup_status" -eq 0 ] || return 1
+  clear_owner_id
+}
+
+create_owner() {
+  if ! auth_config_is_expected; then
+    echo "Gluetun control-server authentication policy is missing or does not match the rendered read-only role" >&2
+    return 1
+  fi
+
+  owner_id=
+  if ! owner_id=$(
+    "$docker_command" create \
+      --rm \
+      "--name=$owner_name" \
+      "--hostname=$owner_hostname" \
+      "--label=$owner_label=$owner_label_value" \
+      "--label=$contract_label=$contract_label_value" \
+      --log-driver=none \
+      "--user=$owner_user" \
+      --cap-drop=ALL \
+{% for capability in gluetun_container_capabilities %}
+      "--cap-add={{ capability }}" \
+{% endfor %}
+      "--device=$tun_device:$tun_device:rwm" \
+      "--network=$owner_network" \
+      --dns=127.0.0.1 \
+      --sysctl=net.ipv6.conf.all.disable_ipv6=1 \
+      --sysctl=net.ipv6.conf.default.disable_ipv6=1 \
+      "--env-file=$environment_file" \
+      --env=HTTP_PROXY= \
+      --env=HTTPS_PROXY= \
+      --env=NO_PROXY= \
+      --env=ALL_PROXY= \
+      --env=FTP_PROXY= \
+      --env=http_proxy= \
+      --env=https_proxy= \
+      --env=no_proxy= \
+      --env=all_proxy= \
+      --env=ftp_proxy= \
+      "--mount=type=bind,src=$data_path,dst=/gluetun" \
+      "--mount=type=bind,src=$secrets_path,dst=/run/secrets,readonly" \
+      "$container_image"
+  ); then
+    echo "Failed to create the Gluetun owner container" >&2
+    return 1
+  fi
+
+  if ! is_full_container_id "$owner_id" \
+    || ! owner_identity_has_contract_labels "$owner_id"; then
+    remove_owner_id "$owner_id" >/dev/null 2>&1 || true
+    echo "Docker returned an invalid or mislabelled Gluetun owner identity" >&2
+    return 1
+  fi
+
+  current_owner_id=
+  if ! current_owner_id=$(discover_exact_owner_id) \
+    || [ "$current_owner_id" != "$owner_id" ]; then
+    remove_owner_id "$owner_id" >/dev/null 2>&1 || true
+    echo "The Gluetun owner name changed during container creation" >&2
+    return 1
+  fi
+
+  if ! write_owner_id "$owner_id"; then
+    remove_owner_id "$owner_id" >/dev/null 2>&1 || true
+    echo "Failed to record the immutable Gluetun owner ID" >&2
+    return 1
+  fi
+}
+
+start_owner() {
+  auth_config_is_expected || {
+    echo "Gluetun control-server authentication policy changed before start" >&2
+    return 1
+  }
+
+  owner_id=$(read_owner_id) || {
+    echo "Missing or invalid remembered Gluetun owner ID" >&2
+    return 1
+  }
+  current_owner_id=$(discover_exact_owner_id) || {
+    echo "The exact Gluetun owner name is no longer resolvable" >&2
+    return 1
+  }
+  [ "$current_owner_id" = "$owner_id" ] || {
+    echo "The Gluetun owner name resolves to a replacement ID" >&2
+    return 1
+  }
+  owner_identity_has_contract_labels "$owner_id" || {
+    echo "The remembered Gluetun owner no longer has its contract labels" >&2
+    return 1
+  }
+  exec "$docker_command" start --attach "$owner_id"
+}
+
+wait_for_owner_health() {
+  owner_id=$(read_owner_id) || return 1
+  elapsed=0
+  while [ "$elapsed" -lt "$health_timeout" ]; do
+    current_owner_id=
+    health_status=
+    if current_owner_id=$(discover_exact_owner_id) \
+      && [ "$current_owner_id" = "$owner_id" ] \
+      && owner_identity_has_contract_labels "$owner_id"; then
+      health_status=$(
+        "$docker_command" container inspect \
+          --format='{% raw %}{{.State.Health.Status}}{% endraw %}' \
+          "$owner_id" 2>/dev/null || true
+      )
+      [ "$health_status" = healthy ] && return 0
+    fi
+    sleep "$health_poll_interval"
+    elapsed=$((elapsed + health_poll_interval))
+  done
+  echo "Gluetun did not become healthy with a stable owner ID within $health_timeout seconds" >&2
+  return 1
+}
+
+stop_owner() {
+  owner_id=$(read_owner_id) || return 0
+  "$docker_command" container stop \
+    --time "$stop_grace_time" "$owner_id" >/dev/null 2>&1 || true
+  exact_container_id_is_absent "$owner_id"
+}
+
+case "${1:-}" in
+  cleanup)
+    cleanup_owner
+    ;;
+  create)
+    create_owner
+    ;;
+  start)
+    start_owner
+    ;;
+  health)
+    wait_for_owner_health
+    ;;
+  stop)
+    stop_owner
+    ;;
+  *)
+    echo "Usage: $0 {cleanup|create|start|health|stop}" >&2
+    exit 2
+    ;;
+esac

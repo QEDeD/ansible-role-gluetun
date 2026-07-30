@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: 2026 MASH project contributors
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+---
+- name: Inspect the removed Gluetun unit file
+  ansible.builtin.stat:
+    path: >-
+      {{ devture_systemd_docker_base_systemd_path }}/{{ gluetun_identifier }}.service
+    follow: false
+  register: gluetun_absent_unit_stat
+
+- name: Inspect the released Gluetun drop-in
+  ansible.builtin.stat:
+    path: >-
+      /etc/systemd/system/{{ gluetun_identifier }}.service.d/zzzz-mash-fail-closed-quiesce.conf
+    follow: false
+  register: gluetun_absent_quiesce_dropin_stat
+
+- name: Inspect the removed Gluetun load state
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - show
+      - --property=LoadState
+      - --value
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_absent_load_state_result
+  changed_when: false
+
+- name: Inspect the removed Gluetun fragment path
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - show
+      - --property=FragmentPath
+      - --value
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_absent_fragment_path_result
+  changed_when: false
+
+- name: Inspect the removed Gluetun drop-in paths
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - show
+      - --property=DropInPaths
+      - --value
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_absent_dropin_paths_result
+  changed_when: false
+
+- name: Inspect the removed Gluetun active state
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - show
+      - --property=ActiveState
+      - --value
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_absent_active_state_result
+  changed_when: false
+
+- name: Inspect any queued job for the removed Gluetun unit
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - show
+      - --property=Job
+      - --value
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_absent_job_result
+  changed_when: false
+
+- name: Inspect process identities for the removed Gluetun unit
+  ansible.builtin.command:
+    argv:
+      - "{{ gluetun_systemd_systemctl_command }}"
+      - show
+      - --property=MainPID
+      - --property=ControlPID
+      - --value
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_absent_process_ids_result
+  changed_when: false
+
+- name: Prove the Gluetun unit is absent on disk and from systemd
+  ansible.builtin.assert:
+    that:
+      - not gluetun_absent_unit_stat.stat.exists | bool
+      - not gluetun_absent_quiesce_dropin_stat.stat.exists | bool
+      - gluetun_absent_load_state_result.stdout | trim == 'not-found'
+      - gluetun_absent_fragment_path_result.stdout | trim | length == 0
+      - gluetun_absent_dropin_paths_result.stdout | trim | length == 0
+      - gluetun_absent_active_state_result.stdout | trim in ['inactive', 'failed']
+      - gluetun_absent_job_result.stdout | trim in ['', '0', '[0 /]']
+      - >-
+        gluetun_absent_process_ids_result.stdout_lines
+        | map('trim')
+        | reject('equalto', '')
+        | difference(['0'])
+        | length
+        == 0
+    fail_msg: >-
+      The removed Gluetun unit or its owned release drop-in remains visible,
+      active, queued or process-bearing after daemon-reload. The owned drop-in
+      will be restored as a retry marker.
