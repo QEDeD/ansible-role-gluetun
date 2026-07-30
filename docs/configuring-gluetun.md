@@ -181,8 +181,9 @@ never force-disconnects unknown endpoints. If an unknown endpoint remains,
 network deletion does not converge and the role retains the network with a
 runtime warning. It also refuses to remove the owner while any unconfigured
 running namespace consumer remains, and it independently stops, removes, and
-proves both the stable owner name and originally resolved owner ID absent even
-if the systemd unit is missing or its cleanup command failed.
+proves the originally resolved owner ID absent even if the systemd unit is
+missing or its cleanup command failed. It separately proves that the stable
+owner name remains absent, without deleting an unverified replacement.
 
 ## Failure behaviour
 

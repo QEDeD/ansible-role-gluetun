@@ -437,17 +437,6 @@
   register: gluetun_service_stop_result
   failed_when: false
 
-- name: Directly stop the stable-name Gluetun owner container
-  ansible.builtin.command:
-    cmd: >-
-      {{ devture_systemd_docker_base_host_command_docker }}
-      container stop
-      --time {{ gluetun_container_stop_grace_time_seconds }}
-      {{ gluetun_identifier }}
-  register: gluetun_direct_owner_name_stop_result
-  changed_when: gluetun_direct_owner_name_stop_result.rc == 0
-  failed_when: false
-
 - name: Directly stop the exact Gluetun owner container
   when: gluetun_uninstall_owner_container_id | length > 0
   ansible.builtin.command:
@@ -458,16 +447,6 @@
       {{ gluetun_uninstall_owner_container_id }}
   register: gluetun_direct_owner_stop_result
   changed_when: gluetun_direct_owner_stop_result.rc == 0
-  failed_when: false
-
-- name: Directly remove the stable-name Gluetun owner container
-  ansible.builtin.command:
-    cmd: >-
-      {{ devture_systemd_docker_base_host_command_docker }}
-      container rm --force
-      {{ gluetun_identifier }}
-  register: gluetun_direct_owner_name_removal_result
-  changed_when: gluetun_direct_owner_name_removal_result.rc == 0
   failed_when: false
 
 - name: Directly remove the exact Gluetun owner container
