@@ -11,9 +11,9 @@ as a Docker container wrapped in a systemd service.
 
 The role is deliberately scoped to a fail-closed, one-owner/one-consumer
 network-namespace design. A protected container can join Gluetun with
-`--network=container:<gluetun-container>`. It then has no independent Docker
-network or published ports and cannot fall back to the host's Internet route
-when the VPN tunnel fails.
+`--network=container:<resolved-full-gluetun-container-ID>`. It then has no
+independent Docker network or published ports and cannot fall back to the
+host's Internet route when the VPN tunnel fails.
 
 The role implicitly depends on:
 
@@ -36,9 +36,12 @@ The role:
 5. stores VPN credentials as mode-`0600` files mounted read-only at
    `/run/secrets`;
 6. isolates stale or standalone protected consumers before owner mutations;
-7. waits for Docker health before the systemd start job succeeds;
-8. cooperates with consumer-side `BindsTo=` stop coupling;
-9. stops and verifies protected consumers before removing the namespace owner.
+7. requires a role-owned label before adopting or removing a same-name owner;
+8. rejects unknown containers sharing the owner's actual network namespace;
+9. validates consumer unit dependency and runtime exact-ID contract markers;
+10. waits for Docker health before the systemd start job succeeds;
+11. cooperates with consumer-side `BindsTo=` stop coupling;
+12. stops and verifies protected consumers before removing the namespace owner.
 
 Gluetun must run its entrypoint as root with network-administration
 capabilities and access to `/dev/net/tun`. This role grants the normal Docker

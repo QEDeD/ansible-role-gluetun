@@ -27,6 +27,7 @@ ExecStartPre={{ devture_systemd_docker_base_host_command_docker }} create \
       --rm \
       --name={{ gluetun_identifier }} \
       --hostname={{ gluetun_container_hostname }} \
+      --label={{ gluetun_container_owner_label }}={{ gluetun_container_owner_label_value }} \
       --log-driver=none \
       --user={{ gluetun_container_user }} \
       --cap-drop=ALL \

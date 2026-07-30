@@ -18,7 +18,22 @@
         gluetun_container_network_known_peer_containers_list | unique | length
         == gluetun_container_network_known_peer_containers_list | length
       - gluetun_identifier is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+      - gluetun_identifier is not match('^[a-f0-9]+$')
       - gluetun_container_network is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+      - gluetun_container_network is not match('^[a-f0-9]+$')
+      - gluetun_container_owner_label == 'io.mash.gluetun.owner'
+      - gluetun_container_owner_label_value == gluetun_identifier
+      - gluetun_container_network_owner_label == 'io.mash.gluetun.owner'
+      - gluetun_container_network_owner_label_value == gluetun_identifier
+      - gluetun_container_stop_grace_time_seconds | string is match('^[0-9]+$')
+      - gluetun_container_stop_grace_time_seconds | int > 0
+      - gluetun_base_path is match('^/[a-zA-Z0-9_./-]+$')
+      - "'..' not in gluetun_base_path.split('/')"
+      - not gluetun_base_path.endswith('/')
+      - gluetun_data_path == gluetun_base_path + '/data'
+      - gluetun_secrets_path == gluetun_base_path + '/secrets'
+      - gluetun_environment_file_path == gluetun_base_path + '/env'
+      - gluetun_companion_resolv_conf_path == gluetun_base_path + '/companion-resolv.conf'
       - >-
         gluetun_systemd_dependent_services_list
         ==
@@ -33,6 +48,7 @@
       - item | type_debug == 'dict'
       - item.keys() | sort == ['container_name', 'systemd_service_name']
       - item.container_name is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+      - item.container_name is not match('^[a-f0-9]+$')
       - item.container_name != gluetun_identifier
       - item.systemd_service_name is match('^[a-zA-Z0-9][a-zA-Z0-9_.@-]*\.service$')
       - item.systemd_service_name != gluetun_identifier + '.service'
@@ -51,24 +67,83 @@
   ansible.builtin.assert:
     that:
       - item is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+      - item is not match('^[a-f0-9]+$')
       - item != gluetun_identifier
     fail_msg: A Gluetun known network peer name is unsafe for cleanup.
   loop: "{{ gluetun_container_network_known_peer_containers_list }}"
 
-- name: Check configured protected-service systemd units
-  ansible.builtin.stat:
-    path: "{{ devture_systemd_docker_base_systemd_path }}/{{ item }}"
-  loop: "{{ gluetun_systemd_dependent_services_list }}"
-  register: gluetun_dependent_service_stats
+- name: Initialize Gluetun uninstall identity state
+  ansible.builtin.set_fact:
+    gluetun_uninstall_owner_container_id: ""
+    gluetun_uninstall_owner_sandbox_id: ""
+    gluetun_uninstall_running_namespace_consumers_list: []
+    gluetun_uninstall_network_id: ""
+    gluetun_uninstall_consumer_resolved_ids_by_name: {}
+    gluetun_uninstall_consumer_ambiguity_messages_list: []
 
-- name: Stop configured protected services before removing Gluetun
-  ansible.builtin.service:
-    name: "{{ item.item }}"
-    state: stopped
-  loop: "{{ gluetun_dependent_service_stats.results }}"
+- name: Query configured protected-consumer identities before uninstall
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container ls --all --no-trunc --quiet
+      --filter 'name=^/{{ item.container_name | regex_escape }}$'
+  loop: "{{ gluetun_protected_consumers_list }}"
   loop_control:
-    label: "{{ item.item }}"
-  when: item.stat.exists | bool
+    label: "{{ item.container_name }}"
+  register: gluetun_uninstall_consumer_identity_query_results
+  changed_when: false
+  failed_when: false
+
+- name: Record ambiguous protected-consumer identities before uninstall
+  ansible.builtin.set_fact:
+    gluetun_uninstall_consumer_ambiguity_messages_list: >-
+      {{
+        gluetun_uninstall_consumer_ambiguity_messages_list
+        + [
+          'The exact-name query for protected consumer `'
+          + item.item.container_name
+          + '` was ambiguous.'
+        ]
+      }}
+  when: >-
+    item.rc != 0
+    or
+    (
+      item.stdout | trim | length > 0
+      and
+      (
+        item.stdout_lines | length != 1
+        or item.stdout_lines[0] is not match('^[a-f0-9]{64}$')
+      )
+    )
+  loop: "{{ gluetun_uninstall_consumer_identity_query_results.results }}"
+  loop_control:
+    label: "{{ item.item.container_name }}"
+
+- name: Record resolved protected-consumer IDs before uninstall
+  ansible.builtin.set_fact:
+    gluetun_uninstall_consumer_resolved_ids_by_name: >-
+      {{
+        gluetun_uninstall_consumer_resolved_ids_by_name
+        | combine({item.item.container_name: item.stdout_lines[0]})
+      }}
+  when:
+    - item.rc == 0
+    - item.stdout_lines | length == 1
+    - item.stdout_lines[0] is match('^[a-f0-9]{64}$')
+  loop: "{{ gluetun_uninstall_consumer_identity_query_results.results }}"
+  loop_control:
+    label: "{{ item.item.container_name }}"
+
+- name: Attempt to stop configured protected-consumer systemd units
+  ansible.builtin.service:
+    name: "{{ item.systemd_service_name }}"
+    state: stopped
+  loop: "{{ gluetun_protected_consumers_list }}"
+  loop_control:
+    label: "{{ item.systemd_service_name }}"
+  register: gluetun_protected_consumer_uninstall_unit_stop_results
+  failed_when: false
 
 - name: Stop configured protected consumer containers before removing Gluetun
   ansible.builtin.command:
@@ -84,22 +159,78 @@
   changed_when: gluetun_protected_consumer_uninstall_stop_results.rc == 0
   failed_when: false
 
+- name: Stop resolved protected-consumer IDs before removing Gluetun
+  when: item.container_name in gluetun_uninstall_consumer_resolved_ids_by_name
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container stop
+      --time {{ gluetun_container_stop_grace_time_seconds }}
+      {{ gluetun_uninstall_consumer_resolved_ids_by_name[item.container_name] }}
+  loop: "{{ gluetun_protected_consumers_list }}"
+  loop_control:
+    label: "{{ item.container_name }}"
+  register: gluetun_resolved_protected_consumer_uninstall_stop_results
+  changed_when: gluetun_resolved_protected_consumer_uninstall_stop_results.rc == 0
+  failed_when: false
+
+- name: Prove configured protected-consumer systemd units are inactive or absent
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - is-active
+      - "{{ item.systemd_service_name }}"
+  loop: "{{ gluetun_protected_consumers_list }}"
+  loop_control:
+    label: "{{ item.systemd_service_name }}"
+  register: gluetun_protected_consumer_uninstall_unit_query_results
+  changed_when: false
+  failed_when: false
+
 - name: Prove protected consumer containers are stopped or absent before removing Gluetun
   ansible.builtin.command:
     cmd: >-
       {{ devture_systemd_docker_base_host_command_docker }}
       container ls --no-trunc --quiet
-      --filter name=^/{{ item.container_name | regex_escape }}$
+      --filter 'name=^/{{ item.container_name | regex_escape }}$'
   loop: "{{ gluetun_protected_consumers_list }}"
   loop_control:
     label: "{{ item.container_name }}"
   register: gluetun_protected_consumer_uninstall_query_results
   changed_when: false
+  failed_when: false
 
-- name: Fail unless protected consumer shutdown converged before removing Gluetun
+- name: Prove resolved protected-consumer IDs are stopped or absent before removing Gluetun
+  when: item.container_name in gluetun_uninstall_consumer_resolved_ids_by_name
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container ls --no-trunc --quiet
+      --filter id={{ gluetun_uninstall_consumer_resolved_ids_by_name[item.container_name] }}
+  loop: "{{ gluetun_protected_consumers_list }}"
+  loop_control:
+    label: "{{ item.container_name }}"
+  register: gluetun_resolved_protected_consumer_uninstall_query_results
+  changed_when: false
+  failed_when: false
+
+- name: Fail unless protected-consumer unit shutdown converged before removing Gluetun
   ansible.builtin.assert:
     that:
-      - item.stdout_lines | length == 0
+      - item.rc in [3, 4]
+      - item.stdout | trim in ['inactive', 'failed', 'unknown']
+    fail_msg: >-
+      Protected-consumer unit `{{ item.item.systemd_service_name }}` is not
+      proven inactive; refusing to remove the Gluetun owner.
+  loop: "{{ gluetun_protected_consumer_uninstall_unit_query_results.results }}"
+  loop_control:
+    label: "{{ item.item.systemd_service_name }}"
+
+- name: Fail unless protected-consumer container shutdown converged before removing Gluetun
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - item.stdout | trim | length == 0
     fail_msg: >-
       Protected consumer `{{ item.item.container_name }}` is still running;
       refusing to remove the Gluetun owner.
@@ -107,23 +238,302 @@
   loop_control:
     label: "{{ item.item.container_name }}"
 
-- name: Check existence of Gluetun systemd service
-  ansible.builtin.stat:
-    path: "{{ devture_systemd_docker_base_systemd_path }}/{{ gluetun_identifier }}.service"
-  register: gluetun_service_stat
+- name: Fail unless resolved protected-consumer IDs stopped before removing Gluetun
+  when: not item.skipped | default(false)
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - item.stdout | trim | length == 0
+    fail_msg: >-
+      The originally resolved ID for protected consumer
+      `{{ item.item.container_name }}` is still running.
+  loop: "{{ gluetun_resolved_protected_consumer_uninstall_query_results.results }}"
+  loop_control:
+    label: "{{ item.item.container_name }}"
 
-- name: Ensure Gluetun systemd service is stopped
-  when: gluetun_service_stat.stat.exists | bool
+- name: Fail closed after isolating ambiguous uninstall consumer identities
+  ansible.builtin.assert:
+    that:
+      - gluetun_uninstall_consumer_ambiguity_messages_list | length == 0
+    fail_msg: "{{ gluetun_uninstall_consumer_ambiguity_messages_list | join(' ') }}"
+
+- name: Query the exact Gluetun owner container before removal
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container ls --all --no-trunc --quiet
+      --filter 'name=^/{{ gluetun_identifier | regex_escape }}$'
+  register: gluetun_uninstall_owner_container_query_result
+  changed_when: false
+
+- name: Validate the exact Gluetun owner container query before removal
+  ansible.builtin.assert:
+    that:
+      - >-
+        gluetun_uninstall_owner_container_query_result.stdout | trim | length == 0
+        or
+        (
+          gluetun_uninstall_owner_container_query_result.stdout_lines | length == 1
+          and
+          gluetun_uninstall_owner_container_query_result.stdout_lines[0]
+          is match('^[a-f0-9]{64}$')
+        )
+    fail_msg: The exact Gluetun owner query was ambiguous; nothing was removed.
+
+- name: Record the exact Gluetun owner container ID for removal
+  ansible.builtin.set_fact:
+    gluetun_uninstall_owner_container_id: >-
+      {{ gluetun_uninstall_owner_container_query_result.stdout_lines[0] }}
+  when: gluetun_uninstall_owner_container_query_result.stdout_lines | length == 1
+
+- name: Inspect the exact Gluetun owner container before removal
+  when: gluetun_uninstall_owner_container_id | length > 0
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container inspect
+      --format='{% raw %}{{.Id}}|{{.Name}}|{{.State.Running}}|{{.NetworkSettings.SandboxID}}|{{index .Config.Labels "io.mash.gluetun.owner"}}{% endraw %}'
+      {{ gluetun_uninstall_owner_container_id }}
+  register: gluetun_uninstall_owner_container_inspect_result
+  changed_when: false
+
+- name: Validate and record the exact Gluetun owner inspection before removal
+  when: gluetun_uninstall_owner_container_id | length > 0
+  vars:
+    gluetun_uninstall_owner_container_inspect_fields: "{{ gluetun_uninstall_owner_container_inspect_result.stdout.split('|') }}"
+  ansible.builtin.assert:
+    that:
+      - gluetun_uninstall_owner_container_inspect_fields | length == 5
+      - gluetun_uninstall_owner_container_inspect_fields[0] == gluetun_uninstall_owner_container_id
+      - gluetun_uninstall_owner_container_inspect_fields[1] == '/' + gluetun_identifier
+      - gluetun_uninstall_owner_container_inspect_fields[2] in ['true', 'false']
+      - >-
+        gluetun_uninstall_owner_container_inspect_fields[3] == ''
+        or
+        gluetun_uninstall_owner_container_inspect_fields[3] is match('^[a-f0-9]{64}$')
+      - >-
+        gluetun_uninstall_owner_container_inspect_fields[4]
+        == gluetun_container_owner_label_value
+    fail_msg: >-
+      The exact Gluetun owner is malformed or lacks the role-owned label;
+      nothing was removed.
+
+- name: Record the Gluetun owner sandbox before removal
+  when: gluetun_uninstall_owner_container_id | length > 0
+  vars:
+    gluetun_uninstall_owner_container_inspect_fields: "{{ gluetun_uninstall_owner_container_inspect_result.stdout.split('|') }}"
+  ansible.builtin.set_fact:
+    gluetun_uninstall_owner_sandbox_id: "{{ gluetun_uninstall_owner_container_inspect_fields[3] }}"
+
+- name: Query all running containers before Gluetun owner removal
+  when: gluetun_uninstall_owner_container_id | length > 0
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container ls --no-trunc --quiet
+  register: gluetun_uninstall_running_container_query_result
+  changed_when: false
+
+- name: Validate running container IDs before Gluetun owner removal
+  when: gluetun_uninstall_owner_container_id | length > 0
+  ansible.builtin.assert:
+    that:
+      - item is match('^[a-f0-9]{64}$')
+    fail_msg: A running-container query returned a malformed identity.
+  loop: "{{ gluetun_uninstall_running_container_query_result.stdout_lines | default([]) }}"
+
+- name: Inspect running containers before Gluetun owner removal
+  when: gluetun_uninstall_owner_container_id | length > 0
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container inspect
+      --format={% raw %}{{.Id}}|{{.State.Running}}|{{.HostConfig.NetworkMode}}|{{.NetworkSettings.SandboxID}}|{{.Name}}{% endraw %}
+      {{ item }}
+  loop: "{{ gluetun_uninstall_running_container_query_result.stdout_lines | default([]) }}"
+  register: gluetun_uninstall_running_container_inspect_results
+  changed_when: false
+
+- name: Validate running-container inspections before Gluetun owner removal
+  vars:
+    gluetun_uninstall_running_container_inspect_fields: "{{ item.stdout.split('|') }}"
+  ansible.builtin.assert:
+    that:
+      - gluetun_uninstall_running_container_inspect_fields | length == 5
+      - gluetun_uninstall_running_container_inspect_fields[0] == item.item
+      - gluetun_uninstall_running_container_inspect_fields[1] == 'true'
+      - >-
+        gluetun_uninstall_running_container_inspect_fields[3] == ''
+        or
+        gluetun_uninstall_running_container_inspect_fields[3] is match('^[a-f0-9]{64}$')
+      - gluetun_uninstall_running_container_inspect_fields[4] is match('^/[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+    fail_msg: A running-container namespace inspection was malformed.
+  loop: "{{ gluetun_uninstall_running_container_inspect_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Record running containers sharing the Gluetun namespace before removal
+  vars:
+    gluetun_uninstall_running_container_inspect_fields: "{{ item.stdout.split('|') }}"
+    gluetun_uninstall_running_container_namespace_reference: >-
+      {{
+        gluetun_uninstall_running_container_inspect_fields[2]
+        | regex_replace('^container:', '')
+      }}
+  ansible.builtin.set_fact:
+    gluetun_uninstall_running_namespace_consumers_list: >-
+      {{
+        gluetun_uninstall_running_namespace_consumers_list
+        + [
+          {
+            'container_id': gluetun_uninstall_running_container_inspect_fields[0],
+            'container_name': gluetun_uninstall_running_container_inspect_fields[4]
+          }
+        ]
+      }}
+  when:
+    - gluetun_uninstall_owner_container_id | length > 0
+    - gluetun_uninstall_running_container_inspect_fields[0] != gluetun_uninstall_owner_container_id
+    - >-
+      (
+        gluetun_uninstall_running_container_inspect_fields[2]
+        == 'container:' + gluetun_uninstall_owner_container_id
+      )
+      or
+      (
+        gluetun_uninstall_running_container_inspect_fields[2]
+        == 'container:' + gluetun_identifier
+      )
+      or
+      (
+        gluetun_uninstall_running_container_inspect_fields[2].startswith('container:')
+        and gluetun_uninstall_running_container_namespace_reference | length >= 12
+        and gluetun_uninstall_owner_container_id.startswith(gluetun_uninstall_running_container_namespace_reference)
+      )
+      or
+      (
+        gluetun_uninstall_owner_sandbox_id | length > 0
+        and gluetun_uninstall_running_container_inspect_fields[3]
+        == gluetun_uninstall_owner_sandbox_id
+      )
+  loop: "{{ gluetun_uninstall_running_container_inspect_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Refuse Gluetun owner removal while a namespace consumer remains
+  ansible.builtin.assert:
+    that:
+      - gluetun_uninstall_running_namespace_consumers_list | length == 0
+    fail_msg: >-
+      A running unknown or unconfigured container still shares the Gluetun
+      network namespace; the owner was retained.
+
+- name: Attempt to stop the Gluetun systemd service
   ansible.builtin.service:
     name: "{{ gluetun_identifier }}"
     state: stopped
     enabled: false
     daemon_reload: true
+  register: gluetun_service_stop_result
+  failed_when: false
+
+- name: Directly stop the stable-name Gluetun owner container
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container stop
+      --time {{ gluetun_container_stop_grace_time_seconds }}
+      {{ gluetun_identifier }}
+  register: gluetun_direct_owner_name_stop_result
+  changed_when: gluetun_direct_owner_name_stop_result.rc == 0
+  failed_when: false
+
+- name: Directly stop the exact Gluetun owner container
+  when: gluetun_uninstall_owner_container_id | length > 0
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container stop
+      --time {{ gluetun_container_stop_grace_time_seconds }}
+      {{ gluetun_uninstall_owner_container_id }}
+  register: gluetun_direct_owner_stop_result
+  changed_when: gluetun_direct_owner_stop_result.rc == 0
+  failed_when: false
+
+- name: Directly remove the stable-name Gluetun owner container
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container rm --force
+      {{ gluetun_identifier }}
+  register: gluetun_direct_owner_name_removal_result
+  changed_when: gluetun_direct_owner_name_removal_result.rc == 0
+  failed_when: false
+
+- name: Directly remove the exact Gluetun owner container
+  when: gluetun_uninstall_owner_container_id | length > 0
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container rm --force
+      {{ gluetun_uninstall_owner_container_id }}
+  register: gluetun_direct_owner_removal_result
+  changed_when: gluetun_direct_owner_removal_result.rc == 0
+  failed_when: false
+
+- name: Prove the Gluetun systemd service is inactive or absent
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - is-active
+      - "{{ gluetun_identifier }}.service"
+  register: gluetun_uninstall_owner_unit_query_result
+  changed_when: false
+  failed_when: false
+
+- name: Prove the exact-name Gluetun owner container is absent
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container ls --all --no-trunc --quiet
+      --filter 'name=^/{{ gluetun_identifier | regex_escape }}$'
+  register: gluetun_uninstall_owner_post_removal_query_result
+  changed_when: false
+
+- name: Prove the originally resolved Gluetun owner ID is absent
+  when: gluetun_uninstall_owner_container_id | length > 0
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container ls --all --no-trunc --quiet
+      --filter id={{ gluetun_uninstall_owner_container_id }}
+  register: gluetun_uninstall_owner_id_post_removal_query_result
+  changed_when: false
+
+- name: Require proven Gluetun owner shutdown and container absence
+  ansible.builtin.assert:
+    that:
+      - gluetun_uninstall_owner_unit_query_result.rc in [3, 4]
+      - gluetun_uninstall_owner_unit_query_result.stdout | trim in ['inactive', 'failed', 'unknown']
+      - gluetun_uninstall_owner_post_removal_query_result.stdout | trim | length == 0
+      - >-
+        gluetun_uninstall_owner_container_id | length == 0
+        or
+        gluetun_uninstall_owner_id_post_removal_query_result.stdout | trim | length == 0
+    fail_msg: >-
+      The Gluetun owner unit is not inactive or its container is not absent;
+      refusing further removal.
 
 - name: Ensure Gluetun systemd service does not exist
   ansible.builtin.file:
     path: "{{ devture_systemd_docker_base_systemd_path }}/{{ gluetun_identifier }}.service"
     state: absent
+  register: gluetun_systemd_service_removal_result
+
+- name: Reload systemd after removing the Gluetun service
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  changed_when: gluetun_systemd_service_removal_result.changed | bool
 
 - name: Ensure Gluetun non-secret support files do not exist
   ansible.builtin.file:
@@ -164,51 +574,135 @@
 - name: Safely remove the Gluetun container network
   when: gluetun_container_network_deletion_enabled | bool
   block:
+    - name: Query the exact Gluetun container network name for removal
+      ansible.builtin.command:
+        cmd: >-
+          {{ devture_systemd_docker_base_host_command_docker }}
+          network ls --no-trunc --quiet
+          --filter 'name=^{{ gluetun_container_network | regex_escape }}$'
+      register: gluetun_uninstall_network_query_result
+      changed_when: false
+
+    - name: Validate the exact Gluetun network query for removal
+      ansible.builtin.assert:
+        that:
+          - >-
+            gluetun_uninstall_network_query_result.stdout | trim | length == 0
+            or
+            (
+              gluetun_uninstall_network_query_result.stdout_lines | length == 1
+              and
+              gluetun_uninstall_network_query_result.stdout_lines[0]
+              is match('^[a-f0-9]{64}$')
+            )
+        fail_msg: The exact Gluetun network query was ambiguous; the network was retained.
+
+    - name: Record the exact Gluetun network ID for removal
+      ansible.builtin.set_fact:
+        gluetun_uninstall_network_id: "{{ gluetun_uninstall_network_query_result.stdout_lines[0] }}"
+      when: gluetun_uninstall_network_query_result.stdout_lines | length == 1
+
+    - name: Inspect Gluetun network ownership metadata before removal
+      when: gluetun_uninstall_network_id | length > 0
+      ansible.builtin.command:
+        cmd: >-
+          {{ devture_systemd_docker_base_host_command_docker }}
+          network inspect
+          --format='{% raw %}{{.Id}}|{{.Name}}|{{.Driver}}|{{.EnableIPv6}}|{{index .Labels "io.mash.gluetun.owner"}}{% endraw %}'
+          {{ gluetun_uninstall_network_id }}
+      register: gluetun_uninstall_network_metadata_result
+      changed_when: false
+
+    - name: Require exact Gluetun network ownership before removal
+      when: gluetun_uninstall_network_id | length > 0
+      vars:
+        gluetun_uninstall_network_metadata_fields: "{{ gluetun_uninstall_network_metadata_result.stdout.split('|') }}"
+      ansible.builtin.assert:
+        that:
+          - gluetun_uninstall_network_metadata_fields | length == 5
+          - gluetun_uninstall_network_metadata_fields[0] == gluetun_uninstall_network_id
+          - gluetun_uninstall_network_metadata_fields[1] == gluetun_container_network
+          - gluetun_uninstall_network_metadata_fields[2] == 'bridge'
+          - gluetun_uninstall_network_metadata_fields[3] == 'false'
+          - >-
+            gluetun_uninstall_network_metadata_fields[4]
+            == gluetun_container_network_owner_label_value
+        fail_msg: >-
+          The exact-name network is not an owned Gluetun IPv4 bridge and was
+          retained without disconnection or deletion.
+
     - name: Disconnect explicitly configured known Gluetun network peers
+      when: gluetun_uninstall_network_id | length > 0
       ansible.builtin.command:
         cmd: >-
           {{ devture_systemd_docker_base_host_command_docker }}
           network disconnect
-          {{ gluetun_container_network }}
+          {{ gluetun_uninstall_network_id }}
           {{ item }}
       loop: "{{ gluetun_container_network_known_peer_containers_list }}"
       register: gluetun_known_peer_disconnection_result
       changed_when: gluetun_known_peer_disconnection_result.rc == 0
       failed_when: false
 
-    - name: Attempt to remove the Gluetun container network without forcing endpoints
-      ansible.builtin.command:
-        cmd: >-
-          {{ devture_systemd_docker_base_host_command_docker }}
-          network rm
-          {{ gluetun_container_network }}
-      register: gluetun_network_deletion_result
-      changed_when: gluetun_network_deletion_result.rc == 0
-      failed_when: false
-
-    - name: Check whether the Gluetun container network remains
+    - name: Inspect remaining Gluetun network endpoints before removal
+      when: gluetun_uninstall_network_id | length > 0
       ansible.builtin.command:
         cmd: >-
           {{ devture_systemd_docker_base_host_command_docker }}
           network inspect
-          {{ gluetun_container_network }}
-      register: gluetun_network_post_deletion_inspect_result
+          --format='{% raw %}{{range .Containers}}{{println .Name}}{{end}}{% endraw %}'
+          {{ gluetun_uninstall_network_id }}
+      register: gluetun_uninstall_network_remaining_endpoints_result
       changed_when: false
-      failed_when: false
 
-    - name: Report retained non-converged Gluetun container network
-      when: gluetun_network_post_deletion_inspect_result.rc == 0
+    - name: Report safely retained Gluetun network with remaining endpoints
+      when:
+        - gluetun_uninstall_network_id | length > 0
+        - gluetun_uninstall_network_remaining_endpoints_result.stdout_lines | length > 0
       ansible.builtin.set_fact:
         devture_playbook_runtime_messages_list: |
           {{
             devture_playbook_runtime_messages_list | default([])
             +
             [
-              "Warning: Gluetun network `" + gluetun_container_network + "` was retained. "
-              + "Only explicitly configured known peers are disconnected; an unknown endpoint "
-              + "or another Docker error prevented safe network removal."
+              "Warning: owned Gluetun network `" + gluetun_container_network
+              + "` was retained because endpoints remain after disconnecting "
+              + "only explicitly configured known peers."
             ]
           }}
+
+    - name: Remove the exact owned Gluetun network without forcing endpoints
+      when:
+        - gluetun_uninstall_network_id | length > 0
+        - gluetun_uninstall_network_remaining_endpoints_result.stdout_lines | length == 0
+      ansible.builtin.command:
+        cmd: >-
+          {{ devture_systemd_docker_base_host_command_docker }}
+          network rm
+          {{ gluetun_uninstall_network_id }}
+      register: gluetun_network_deletion_result
+      changed_when: gluetun_network_deletion_result.rc == 0
+
+    - name: Prove removed Gluetun network is explicitly absent
+      when:
+        - gluetun_uninstall_network_id | length > 0
+        - gluetun_uninstall_network_remaining_endpoints_result.stdout_lines | length == 0
+      ansible.builtin.command:
+        cmd: >-
+          {{ devture_systemd_docker_base_host_command_docker }}
+          network ls --no-trunc --quiet
+          --filter 'name=^{{ gluetun_container_network | regex_escape }}$'
+      register: gluetun_uninstall_network_post_removal_query_result
+      changed_when: false
+
+    - name: Require explicit Gluetun network absence after removal
+      when:
+        - gluetun_uninstall_network_id | length > 0
+        - gluetun_uninstall_network_remaining_endpoints_result.stdout_lines | length == 0
+      ansible.builtin.assert:
+        that:
+          - gluetun_uninstall_network_post_removal_query_result.stdout | trim | length == 0
+        fail_msg: The owned Gluetun network was not proven absent after removal.
 
 - name: Remove empty Gluetun data path
   ansible.builtin.command:

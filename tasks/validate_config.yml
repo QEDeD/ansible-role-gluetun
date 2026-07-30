@@ -43,6 +43,7 @@
   ansible.builtin.assert:
     that:
       - gluetun_identifier is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+      - gluetun_identifier is not match('^[a-f0-9]+$')
       - gluetun_base_path is match('^/[a-zA-Z0-9_./-]+$')
       - "'..' not in gluetun_base_path.split('/')"
       - not gluetun_base_path.endswith('/')
@@ -58,7 +59,12 @@
       - gluetun_container_image is match('^(?:[a-zA-Z0-9._:-]+/)*qmcgaw/gluetun:v3[.]41[.]2$')
       - gluetun_container_user == '0:0'
       - gluetun_container_network is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+      - gluetun_container_network is not match('^[a-f0-9]+$')
       - gluetun_container_hostname is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+      - gluetun_container_owner_label == 'io.mash.gluetun.owner'
+      - gluetun_container_owner_label_value == gluetun_identifier
+      - gluetun_container_network_owner_label == 'io.mash.gluetun.owner'
+      - gluetun_container_network_owner_label_value == gluetun_identifier
       - not gluetun_container_network_ipv6_enabled | bool
       - gluetun_vpn_type in ['openvpn', 'wireguard']
       - gluetun_vpn_provider_environment_variables_custom | type_debug == 'dict'
@@ -71,13 +77,30 @@
       - gluetun_container_network_known_peer_containers_list | type_debug == 'list'
       - gluetun_container_capabilities | type_debug == 'list'
       - gluetun_secret_files | type_debug == 'list'
+      - gluetun_systemd_required_services_list | type_debug == 'list'
+      - gluetun_systemd_wanted_services_list | type_debug == 'list'
+      - gluetun_container_stop_grace_time_seconds | string is match('^[0-9]+$')
+      - gluetun_container_cleanup_attempts | string is match('^[0-9]+$')
+      - gluetun_container_cleanup_retry_delay_seconds | string is match('^[0-9]+$')
+      - gluetun_container_health_startup_timeout_seconds | string is match('^[0-9]+$')
+      - gluetun_container_health_poll_interval_seconds | string is match('^[0-9]+$')
+      - gluetun_systemd_start_timeout_margin_seconds | string is match('^[0-9]+$')
+      - gluetun_systemd_start_timeout_seconds | string is match('^[0-9]+$')
+      - gluetun_container_stop_grace_time_seconds | int > 0
+      - gluetun_container_cleanup_attempts | int > 0
+      - gluetun_container_cleanup_retry_delay_seconds | int >= 0
       - gluetun_container_health_startup_timeout_seconds | int > 0
       - gluetun_container_health_poll_interval_seconds | int > 0
+      - gluetun_systemd_start_timeout_margin_seconds | int > 0
       - >-
         gluetun_systemd_start_timeout_seconds | int
-        >= (gluetun_container_cleanup_timeout_seconds | int)
+        == (gluetun_container_cleanup_attempts | int)
+        * (
+          (gluetun_container_stop_grace_time_seconds | int)
+          + (gluetun_container_cleanup_retry_delay_seconds | int)
+        )
         + (gluetun_container_health_startup_timeout_seconds | int)
-        + 30
+        + (gluetun_systemd_start_timeout_margin_seconds | int)
       - gluetun_systemd_dependent_services_list | length <= 1
       - gluetun_protected_consumers_list | length <= 1
       - >-
@@ -90,11 +113,26 @@
         gluetun_systemd_dependent_services_list | unique | length
         == gluetun_systemd_dependent_services_list | length
       - >-
+        gluetun_systemd_required_services_list | unique | length
+        == gluetun_systemd_required_services_list | length
+      - >-
+        gluetun_systemd_wanted_services_list | unique | length
+        == gluetun_systemd_wanted_services_list | length
+      - >-
         gluetun_container_network_known_peer_containers_list | unique | length
         == gluetun_container_network_known_peer_containers_list | length
       - >-
-        gluetun_firewall_input_ports | map('int') | unique | length
-        == gluetun_firewall_input_ports | length
+        gluetun_systemd_required_services_list
+        | intersect(gluetun_systemd_dependent_services_list)
+        | length == 0
+      - >-
+        gluetun_container_network_known_peer_containers_list
+        | intersect(
+          gluetun_protected_consumers_list
+          | map(attribute='container_name')
+          | list
+        )
+        | length == 0
     fail_msg: One or more Gluetun settings has an invalid type, value, or format.
 
 - name: Validate Gluetun protected-consumer definitions
@@ -103,6 +141,7 @@
       - item | type_debug == 'dict'
       - item.keys() | sort == ['container_name', 'systemd_service_name']
       - item.container_name is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+      - item.container_name is not match('^[a-f0-9]+$')
       - item.container_name != gluetun_identifier
       - item.systemd_service_name is match('^[a-zA-Z0-9][a-zA-Z0-9_.@-]*\.service$')
       - item.systemd_service_name != gluetun_identifier + '.service'
@@ -132,6 +171,8 @@
   ansible.builtin.assert:
     that:
       - gluetun_firewall_enabled | bool
+      - gluetun_container_tun_device_path == '/dev/net/tun'
+      - gluetun_firewall_input_ports | length == 0
       - gluetun_firewall_vpn_input_ports | length == 0
       - gluetun_firewall_outbound_subnets | length == 0
       - gluetun_dns_server_enabled | bool
@@ -145,6 +186,8 @@
       - not gluetun_shadowsocks_enabled | bool
       - not gluetun_vpn_port_forwarding_enabled | bool
       - not gluetun_pprof_enabled | bool
+      - gluetun_health_target_addresses == ['cloudflare.com:443', 'github.com:443']
+      - gluetun_health_icmp_target_ips == ['1.1.1.1', '8.8.8.8']
       - >-
         (gluetun_container_capabilities | sort)
         ==
@@ -168,19 +211,6 @@
     fail_msg: >-
       The requested configuration weakens the role's fail-closed security
       contract and is not supported.
-
-- name: Validate explicitly allowed local Gluetun ingress ports
-  ansible.builtin.assert:
-    that:
-      - item | string is match('^[0-9]+$')
-      - (item | int) >= 1
-      - (item | int) <= 65535
-      - (item | int) not in [53, 8000, 9999]
-    fail_msg: >-
-      Gluetun local ingress ports must be unique integers from 1 through
-      65535 and cannot collide with the role-owned DNS, control, or health
-      listeners (53, 8000, and 9999).
-  loop: "{{ gluetun_firewall_input_ports }}"
 
 - name: Validate Gluetun encrypted DNS settings
   ansible.builtin.assert:
@@ -261,10 +291,27 @@
     fail_msg: A Gluetun dependent service name is invalid.
   loop: "{{ gluetun_systemd_dependent_services_list }}"
 
+- name: Validate Gluetun owner dependency service names
+  ansible.builtin.assert:
+    that:
+      - item | type_debug == 'str'
+      - item is match('^[a-zA-Z0-9][a-zA-Z0-9_.@-]*\.service$')
+      - item != gluetun_identifier + '.service'
+    fail_msg: A Gluetun required or wanted service name is invalid or self-referential.
+  loop: >-
+    {{
+      (
+        gluetun_systemd_required_services_list
+        + gluetun_systemd_wanted_services_list
+      )
+      | unique
+    }}
+
 - name: Validate Gluetun known network peer container names
   ansible.builtin.assert:
     that:
       - item is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+      - item is not match('^[a-f0-9]+$')
       - item != gluetun_identifier
     fail_msg: A Gluetun known network peer container name is invalid.
   loop: "{{ gluetun_container_network_known_peer_containers_list }}"

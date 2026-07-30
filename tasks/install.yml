@@ -3,62 +3,168 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 ---
+- name: Initialize Gluetun pre-mutation state
+  ansible.builtin.set_fact:
+    gluetun_existing_owner_container_id: ""
+    gluetun_existing_owner_container_id_candidate: ""
+    gluetun_existing_owner_is_running: false
+    gluetun_existing_owner_sandbox_id: ""
+    gluetun_existing_protected_consumers_list: []
+    gluetun_configured_consumer_container_ids_list: []
+    gluetun_protected_consumer_resolved_ids_by_name: {}
+    gluetun_protected_consumers_requiring_isolation_list: []
+    gluetun_pre_mutation_ambiguity_messages_list: []
+    gluetun_running_namespace_consumers_list: []
+
 - name: Query the current Gluetun owner container
   ansible.builtin.command:
     cmd: >-
       {{ devture_systemd_docker_base_host_command_docker }}
       container ls --all --no-trunc --quiet
-      --filter name=^/{{ gluetun_identifier | regex_escape }}$
+      --filter 'name=^/{{ gluetun_identifier | regex_escape }}$'
   register: gluetun_existing_owner_container_query_result
   changed_when: false
+  failed_when: false
 
-- name: Validate the current Gluetun owner container query
-  ansible.builtin.assert:
-    that:
-      - gluetun_existing_owner_container_query_result.stdout_lines | length <= 1
-    fail_msg: The Gluetun owner container query returned an ambiguous result.
+- name: Record an ambiguous current Gluetun owner query
+  ansible.builtin.set_fact:
+    gluetun_pre_mutation_ambiguity_messages_list: >-
+      {{
+        gluetun_pre_mutation_ambiguity_messages_list
+        + ['The exact-name Gluetun owner query was ambiguous.']
+      }}
+  when: >-
+    gluetun_existing_owner_container_query_result.rc != 0
+    or
+    (
+      gluetun_existing_owner_container_query_result.stdout | trim | length > 0
+      and
+      (
+        gluetun_existing_owner_container_query_result.stdout_lines | length != 1
+        or
+        gluetun_existing_owner_container_query_result.stdout_lines[0]
+        is not match('^[a-f0-9]{64}$')
+      )
+    )
+
+- name: Record the current Gluetun owner container ID candidate
+  ansible.builtin.set_fact:
+    gluetun_existing_owner_container_id_candidate: >-
+      {{ gluetun_existing_owner_container_query_result.stdout_lines[0] }}
+  when:
+    - gluetun_existing_owner_container_query_result.rc == 0
+    - gluetun_existing_owner_container_query_result.stdout_lines | length == 1
+    - gluetun_existing_owner_container_query_result.stdout_lines[0] is match('^[a-f0-9]{64}$')
 
 - name: Inspect the current Gluetun owner container
-  when: gluetun_existing_owner_container_query_result.stdout_lines | length == 1
+  when: gluetun_existing_owner_container_id_candidate | length > 0
   ansible.builtin.command:
     cmd: >-
       {{ devture_systemd_docker_base_host_command_docker }}
-      container inspect {{ gluetun_identifier }}
+      container inspect
+      --format='{% raw %}{{.Id}}|{{.Name}}|{{.State.Running}}|{{.NetworkSettings.SandboxID}}|{{index .Config.Labels "io.mash.gluetun.owner"}}{% endraw %}'
+      {{ gluetun_existing_owner_container_id_candidate }}
   register: gluetun_existing_owner_container_inspect_result
   changed_when: false
+  failed_when: false
 
-- name: Record the current Gluetun owner container ID
-  ansible.builtin.set_fact:
-    gluetun_existing_owner_container_id: >-
+- name: Record an ambiguous current Gluetun owner inspection
+  vars:
+    gluetun_existing_owner_container_inspect_fields: >-
       {{
-        (
-          gluetun_existing_owner_container_inspect_result.stdout
-          | from_json
-          | first
-        ).Id
-        if gluetun_existing_owner_container_query_result.stdout_lines | length == 1
-        else ''
+        gluetun_existing_owner_container_inspect_result.stdout.split('|')
+        if gluetun_existing_owner_container_inspect_result.rc | default(1) == 0
+        else []
       }}
+    gluetun_existing_owner_container_inspection_is_valid: >-
+      {{
+        gluetun_existing_owner_container_inspect_result.rc | default(1) == 0
+        and gluetun_existing_owner_container_inspect_fields | length == 5
+        and gluetun_existing_owner_container_inspect_fields[0] == gluetun_existing_owner_container_id_candidate
+        and gluetun_existing_owner_container_inspect_fields[1] == '/' + gluetun_identifier
+        and gluetun_existing_owner_container_inspect_fields[2] in ['true', 'false']
+        and (
+          gluetun_existing_owner_container_inspect_fields[3] == ''
+          or gluetun_existing_owner_container_inspect_fields[3] is match('^[a-f0-9]{64}$')
+        )
+        and
+        (
+          gluetun_existing_owner_container_inspect_fields[4]
+          == gluetun_container_owner_label_value
+        )
+      }}
+  ansible.builtin.set_fact:
+    gluetun_pre_mutation_ambiguity_messages_list: >-
+      {{
+        gluetun_pre_mutation_ambiguity_messages_list
+        + ['The exact-ID Gluetun owner inspection was ambiguous.']
+      }}
+  when:
+    - gluetun_existing_owner_container_id_candidate | length > 0
+    - not gluetun_existing_owner_container_inspection_is_valid | bool
+
+- name: Record the positively identified current Gluetun owner
+  vars:
+    gluetun_existing_owner_container_inspect_fields: "{{ gluetun_existing_owner_container_inspect_result.stdout.split('|') }}"
+  ansible.builtin.set_fact:
+    gluetun_existing_owner_container_id: "{{ gluetun_existing_owner_container_inspect_fields[0] }}"
+    gluetun_existing_owner_is_running: "{{ gluetun_existing_owner_container_inspect_fields[2] == 'true' }}"
+    gluetun_existing_owner_sandbox_id: "{{ gluetun_existing_owner_container_inspect_fields[3] }}"
+  when:
+    - gluetun_existing_owner_container_id_candidate | length > 0
+    - gluetun_existing_owner_container_inspect_result.rc | default(1) == 0
+    - gluetun_existing_owner_container_inspect_fields | length == 5
+    - gluetun_existing_owner_container_inspect_fields[0] == gluetun_existing_owner_container_id_candidate
+    - gluetun_existing_owner_container_inspect_fields[1] == '/' + gluetun_identifier
+    - gluetun_existing_owner_container_inspect_fields[2] in ['true', 'false']
+    - >-
+      gluetun_existing_owner_container_inspect_fields[3] == ''
+      or
+      gluetun_existing_owner_container_inspect_fields[3] is match('^[a-f0-9]{64}$')
+    - >-
+      gluetun_existing_owner_container_inspect_fields[4]
+      == gluetun_container_owner_label_value
 
 - name: Query configured protected Gluetun consumers
   ansible.builtin.command:
     cmd: >-
       {{ devture_systemd_docker_base_host_command_docker }}
       container ls --all --no-trunc --quiet
-      --filter name=^/{{ item.container_name | regex_escape }}$
+      --filter 'name=^/{{ item.container_name | regex_escape }}$'
   loop: "{{ gluetun_protected_consumers_list }}"
   loop_control:
     label: "{{ item.container_name }}"
   register: gluetun_protected_consumer_query_results
   changed_when: false
+  failed_when: false
 
-- name: Validate configured protected-consumer queries
-  ansible.builtin.assert:
-    that:
-      - item.stdout_lines | length <= 1
-    fail_msg: >-
-      The query for protected consumer `{{ item.item.container_name }}`
-      returned an ambiguous result.
+- name: Conservatively isolate ambiguous protected-consumer queries
+  ansible.builtin.set_fact:
+    gluetun_protected_consumers_requiring_isolation_list: >-
+      {{
+        gluetun_protected_consumers_requiring_isolation_list
+        + [item.item]
+      }}
+    gluetun_pre_mutation_ambiguity_messages_list: >-
+      {{
+        gluetun_pre_mutation_ambiguity_messages_list
+        + [
+          'The exact-name query for protected consumer `'
+          + item.item.container_name
+          + '` was ambiguous.'
+        ]
+      }}
+  when: >-
+    item.rc != 0
+    or
+    (
+      item.stdout | trim | length > 0
+      and
+      (
+        item.stdout_lines | length != 1
+        or item.stdout_lines[0] is not match('^[a-f0-9]{64}$')
+      )
+    )
   loop: "{{ gluetun_protected_consumer_query_results.results }}"
   loop_control:
     label: "{{ item.item.container_name }}"
@@ -67,10 +173,23 @@
   ansible.builtin.set_fact:
     gluetun_existing_protected_consumers_list: >-
       {{
-        gluetun_existing_protected_consumers_list | default([])
-        + [item.item]
+        gluetun_existing_protected_consumers_list
+        + [
+          {
+            'container_id': item.stdout_lines[0],
+            'definition': item.item
+          }
+        ]
       }}
-  when: item.stdout_lines | length == 1
+    gluetun_protected_consumer_resolved_ids_by_name: >-
+      {{
+        gluetun_protected_consumer_resolved_ids_by_name
+        | combine({item.item.container_name: item.stdout_lines[0]})
+      }}
+  when:
+    - item.rc == 0
+    - item.stdout_lines | length == 1
+    - item.stdout_lines[0] is match('^[a-f0-9]{64}$')
   loop: "{{ gluetun_protected_consumer_query_results.results }}"
   loop_control:
     label: "{{ item.item.container_name }}"
@@ -79,54 +198,118 @@
   ansible.builtin.command:
     cmd: >-
       {{ devture_systemd_docker_base_host_command_docker }}
-      container inspect {{ item.container_name }}
-  loop: "{{ gluetun_existing_protected_consumers_list | default([]) }}"
+      container inspect
+      --format={% raw %}{{.Id}}|{{.Name}}|{{.State.Running}}|{{.HostConfig.NetworkMode}}|{{.NetworkSettings.SandboxID}}{% endraw %}
+      {{ item.container_id }}
+  loop: "{{ gluetun_existing_protected_consumers_list }}"
   loop_control:
-    label: "{{ item.container_name }}"
+    label: "{{ item.definition.container_name }}"
   register: gluetun_protected_consumer_inspect_results
   changed_when: false
+  failed_when: false
 
-- name: Identify protected Gluetun consumers requiring isolation
+- name: Record positively inspected configured consumer IDs
   vars:
-    gluetun_protected_consumer_inspection: "{{ item.stdout | from_json | first }}"
+    gluetun_protected_consumer_inspect_fields: >-
+      {{ item.stdout.split('|') if item.rc == 0 else [] }}
+    gluetun_protected_consumer_inspection_is_valid: >-
+      {{
+        item.rc == 0
+        and gluetun_protected_consumer_inspect_fields | length == 5
+        and gluetun_protected_consumer_inspect_fields[0] == item.item.container_id
+        and gluetun_protected_consumer_inspect_fields[1] == '/' + item.item.definition.container_name
+        and gluetun_protected_consumer_inspect_fields[2] in ['true', 'false']
+        and (
+          gluetun_protected_consumer_inspect_fields[4] == ''
+          or gluetun_protected_consumer_inspect_fields[4] is match('^[a-f0-9]{64}$')
+        )
+      }}
+  ansible.builtin.set_fact:
+    gluetun_configured_consumer_container_ids_list: >-
+      {{
+        gluetun_configured_consumer_container_ids_list
+        + [item.item.container_id]
+      }}
+  when: gluetun_protected_consumer_inspection_is_valid | bool
+  loop: "{{ gluetun_protected_consumer_inspect_results.results }}"
+  loop_control:
+    label: "{{ item.item.definition.container_name }}"
+
+- name: Conservatively isolate ambiguous protected-consumer inspections
+  vars:
+    gluetun_protected_consumer_inspect_fields: >-
+      {{ item.stdout.split('|') if item.rc == 0 else [] }}
+    gluetun_protected_consumer_inspection_is_valid: >-
+      {{
+        item.rc == 0
+        and gluetun_protected_consumer_inspect_fields | length == 5
+        and gluetun_protected_consumer_inspect_fields[0] == item.item.container_id
+        and gluetun_protected_consumer_inspect_fields[1] == '/' + item.item.definition.container_name
+        and gluetun_protected_consumer_inspect_fields[2] in ['true', 'false']
+        and (
+          gluetun_protected_consumer_inspect_fields[4] == ''
+          or gluetun_protected_consumer_inspect_fields[4] is match('^[a-f0-9]{64}$')
+        )
+      }}
   ansible.builtin.set_fact:
     gluetun_protected_consumers_requiring_isolation_list: >-
       {{
-        gluetun_protected_consumers_requiring_isolation_list | default([])
-        + [item.item]
+        gluetun_protected_consumers_requiring_isolation_list
+        + [item.item.definition]
+      }}
+    gluetun_pre_mutation_ambiguity_messages_list: >-
+      {{
+        gluetun_pre_mutation_ambiguity_messages_list
+        + [
+          'The exact-ID inspection for protected consumer `'
+          + item.item.definition.container_name
+          + '` was ambiguous.'
+        ]
+      }}
+  when: not gluetun_protected_consumer_inspection_is_valid | bool
+  loop: "{{ gluetun_protected_consumer_inspect_results.results }}"
+  loop_control:
+    label: "{{ item.item.definition.container_name }}"
+
+- name: Identify running protected consumers not using the exact current owner ID
+  vars:
+    gluetun_protected_consumer_inspect_fields: "{{ item.stdout.split('|') }}"
+  ansible.builtin.set_fact:
+    gluetun_protected_consumers_requiring_isolation_list: >-
+      {{
+        gluetun_protected_consumers_requiring_isolation_list
+        + [item.item.definition]
       }}
   when:
-    - gluetun_protected_consumer_inspection.State.Running | bool
+    - item.rc == 0
+    - gluetun_protected_consumer_inspect_fields | length == 5
+    - gluetun_protected_consumer_inspect_fields[0] == item.item.container_id
+    - gluetun_protected_consumer_inspect_fields[1] == '/' + item.item.definition.container_name
+    - gluetun_protected_consumer_inspect_fields[2] == 'true'
+    - >-
+      gluetun_protected_consumer_inspect_fields[4] == ''
+      or
+      gluetun_protected_consumer_inspect_fields[4] is match('^[a-f0-9]{64}$')
     - >-
       gluetun_existing_owner_container_id | length == 0
       or
-      gluetun_protected_consumer_inspection.HostConfig.NetworkMode
+      not (gluetun_existing_owner_is_running | bool)
+      or
+      gluetun_protected_consumer_inspect_fields[3]
       != 'container:' + gluetun_existing_owner_container_id
   loop: "{{ gluetun_protected_consumer_inspect_results.results }}"
   loop_control:
-    label: "{{ item.item.container_name }}"
+    label: "{{ item.item.definition.container_name }}"
 
-- name: Check systemd units for protected consumers requiring isolation
-  ansible.builtin.stat:
-    path: >-
-      {{
-        devture_systemd_docker_base_systemd_path
-        + '/'
-        + item.systemd_service_name
-      }}
-  loop: "{{ gluetun_protected_consumers_requiring_isolation_list | default([]) }}"
+- name: Attempt to stop systemd units for protected consumers requiring isolation
+  ansible.builtin.service:
+    name: "{{ item.systemd_service_name }}"
+    state: stopped
+  loop: "{{ gluetun_protected_consumers_requiring_isolation_list }}"
   loop_control:
     label: "{{ item.systemd_service_name }}"
-  register: gluetun_unsafe_protected_consumer_unit_stats
-
-- name: Stop systemd units for protected consumers requiring isolation
-  ansible.builtin.service:
-    name: "{{ item.item.systemd_service_name }}"
-    state: stopped
-  when: item.stat.exists | bool
-  loop: "{{ gluetun_unsafe_protected_consumer_unit_stats.results }}"
-  loop_control:
-    label: "{{ item.item.systemd_service_name }}"
+  register: gluetun_unsafe_protected_consumer_unit_stop_results
+  failed_when: false
 
 - name: Stop protected consumer containers requiring isolation
   ansible.builtin.command:
@@ -135,11 +318,39 @@
       container stop
       --time {{ gluetun_container_stop_grace_time_seconds }}
       {{ item.container_name }}
-  loop: "{{ gluetun_protected_consumers_requiring_isolation_list | default([]) }}"
+  loop: "{{ gluetun_protected_consumers_requiring_isolation_list }}"
   loop_control:
     label: "{{ item.container_name }}"
   register: gluetun_unsafe_protected_consumer_stop_results
   changed_when: gluetun_unsafe_protected_consumer_stop_results.rc == 0
+  failed_when: false
+
+- name: Stop positively resolved protected-consumer IDs requiring isolation
+  when: item.container_name in gluetun_protected_consumer_resolved_ids_by_name
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container stop
+      --time {{ gluetun_container_stop_grace_time_seconds }}
+      {{ gluetun_protected_consumer_resolved_ids_by_name[item.container_name] }}
+  loop: "{{ gluetun_protected_consumers_requiring_isolation_list }}"
+  loop_control:
+    label: "{{ item.container_name }}"
+  register: gluetun_unsafe_resolved_protected_consumer_stop_results
+  changed_when: gluetun_unsafe_resolved_protected_consumer_stop_results.rc == 0
+  failed_when: false
+
+- name: Prove isolated protected-consumer systemd units are inactive or absent
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - is-active
+      - "{{ item.systemd_service_name }}"
+  loop: "{{ gluetun_protected_consumers_requiring_isolation_list }}"
+  loop_control:
+    label: "{{ item.systemd_service_name }}"
+  register: gluetun_isolated_protected_consumer_unit_query_results
+  changed_when: false
   failed_when: false
 
 - name: Prove isolated protected consumer containers are stopped or absent
@@ -147,23 +358,241 @@
     cmd: >-
       {{ devture_systemd_docker_base_host_command_docker }}
       container ls --no-trunc --quiet
-      --filter name=^/{{ item.container_name | regex_escape }}$
-  loop: "{{ gluetun_protected_consumers_requiring_isolation_list | default([]) }}"
+      --filter 'name=^/{{ item.container_name | regex_escape }}$'
+  loop: "{{ gluetun_protected_consumers_requiring_isolation_list }}"
   loop_control:
     label: "{{ item.container_name }}"
   register: gluetun_isolated_protected_consumer_query_results
   changed_when: false
+  failed_when: false
 
-- name: Fail unless protected consumer isolation converged
+- name: Prove originally resolved protected-consumer IDs are no longer running
+  when: item.container_name in gluetun_protected_consumer_resolved_ids_by_name
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container ls --no-trunc --quiet
+      --filter id={{ gluetun_protected_consumer_resolved_ids_by_name[item.container_name] }}
+  loop: "{{ gluetun_protected_consumers_requiring_isolation_list }}"
+  loop_control:
+    label: "{{ item.container_name }}"
+  register: gluetun_isolated_resolved_protected_consumer_query_results
+  changed_when: false
+  failed_when: false
+
+- name: Fail unless protected-consumer unit isolation converged
   ansible.builtin.assert:
     that:
-      - item.stdout_lines | length == 0
+      - item.rc in [3, 4]
+      - item.stdout | trim in ['inactive', 'failed', 'unknown']
+    fail_msg: >-
+      Protected-consumer unit `{{ item.item.systemd_service_name }}` is not
+      proven inactive; refusing to mutate or install the Gluetun owner.
+  loop: "{{ gluetun_isolated_protected_consumer_unit_query_results.results }}"
+  loop_control:
+    label: "{{ item.item.systemd_service_name }}"
+
+- name: Fail unless protected-consumer container isolation converged
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - item.stdout | trim | length == 0
     fail_msg: >-
       Protected consumer `{{ item.item.container_name }}` is still running;
       refusing to mutate or install the Gluetun owner.
   loop: "{{ gluetun_isolated_protected_consumer_query_results.results }}"
   loop_control:
     label: "{{ item.item.container_name }}"
+
+- name: Fail unless originally resolved consumer IDs are isolated
+  when: not item.skipped | default(false)
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - item.stdout | trim | length == 0
+    fail_msg: >-
+      The originally resolved ID for protected consumer
+      `{{ item.item.container_name }}` is still running.
+  loop: "{{ gluetun_isolated_resolved_protected_consumer_query_results.results }}"
+  loop_control:
+    label: "{{ item.item.container_name }}"
+
+- name: Fail closed after isolating any ambiguous configured consumer
+  ansible.builtin.assert:
+    that:
+      - gluetun_pre_mutation_ambiguity_messages_list | length == 0
+    fail_msg: >-
+      {{
+        gluetun_pre_mutation_ambiguity_messages_list
+        | join(' ')
+      }}
+
+- name: Check configured protected-consumer unit contracts
+  ansible.builtin.stat:
+    path: >-
+      {{
+        devture_systemd_docker_base_systemd_path
+        + '/'
+        + item.systemd_service_name
+      }}
+  loop: "{{ gluetun_protected_consumers_list }}"
+  loop_control:
+    label: "{{ item.systemd_service_name }}"
+  register: gluetun_protected_consumer_unit_stats
+
+- name: Require configured protected-consumer units before reverse startup coupling
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists | bool
+      - item.stat.isreg | default(false) | bool
+    fail_msg: >-
+      Protected-consumer unit `{{ item.item.systemd_service_name }}` must be
+      rendered before Gluetun can add a reverse Wants= relationship.
+  loop: "{{ gluetun_protected_consumer_unit_stats.results }}"
+  loop_control:
+    label: "{{ item.item.systemd_service_name }}"
+
+- name: Read configured protected-consumer unit contracts
+  ansible.builtin.slurp:
+    src: >-
+      {{
+        devture_systemd_docker_base_systemd_path
+        + '/'
+        + item.systemd_service_name
+      }}
+  loop: "{{ gluetun_protected_consumers_list }}"
+  loop_control:
+    label: "{{ item.systemd_service_name }}"
+  register: gluetun_protected_consumer_unit_contents
+
+- name: Verify configured protected-consumer unit contracts
+  vars:
+    gluetun_protected_consumer_unit_lines: >-
+      {{ (item.content | b64decode).splitlines() }}
+  ansible.builtin.assert:
+    that:
+      - "'BindsTo=' + gluetun_identifier + '.service' in gluetun_protected_consumer_unit_lines"
+      - "'After=' + gluetun_identifier + '.service' in gluetun_protected_consumer_unit_lines"
+      - >-
+        '# MASH-NetworkNamespaceOwner=' + gluetun_identifier
+        in gluetun_protected_consumer_unit_lines
+      - >-
+        '# MASH-NetworkNamespaceIdentity=resolved-full-container-id'
+        in gluetun_protected_consumer_unit_lines
+    fail_msg: >-
+      Protected-consumer unit `{{ item.item.systemd_service_name }}` lacks
+      the required owner dependency or runtime exact-ID contract markers.
+  loop: "{{ gluetun_protected_consumer_unit_contents.results }}"
+  loop_control:
+    label: "{{ item.item.systemd_service_name }}"
+
+- name: Query all running containers for namespace-registry validation
+  when: gluetun_existing_owner_container_id | length > 0
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container ls --no-trunc --quiet
+  register: gluetun_running_container_query_result
+  changed_when: false
+
+- name: Validate running container IDs for namespace-registry validation
+  when: gluetun_existing_owner_container_id | length > 0
+  ansible.builtin.assert:
+    that:
+      - item is match('^[a-f0-9]{64}$')
+    fail_msg: A running-container query returned a malformed container ID.
+  loop: "{{ gluetun_running_container_query_result.stdout_lines | default([]) }}"
+
+- name: Inspect running containers for shared Gluetun namespace use
+  when: gluetun_existing_owner_container_id | length > 0
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      container inspect
+      --format={% raw %}{{.Id}}|{{.State.Running}}|{{.HostConfig.NetworkMode}}|{{.NetworkSettings.SandboxID}}|{{.Name}}{% endraw %}
+      {{ item }}
+  loop: "{{ gluetun_running_container_query_result.stdout_lines | default([]) }}"
+  register: gluetun_running_container_inspect_results
+  changed_when: false
+
+- name: Validate running-container namespace inspections
+  vars:
+    gluetun_running_container_inspect_fields: "{{ item.stdout.split('|') }}"
+  ansible.builtin.assert:
+    that:
+      - gluetun_running_container_inspect_fields | length == 5
+      - gluetun_running_container_inspect_fields[0] == item.item
+      - gluetun_running_container_inspect_fields[1] == 'true'
+      - >-
+        gluetun_running_container_inspect_fields[3] == ''
+        or
+        gluetun_running_container_inspect_fields[3] is match('^[a-f0-9]{64}$')
+      - gluetun_running_container_inspect_fields[4] is match('^/[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+    fail_msg: A running-container namespace inspection was malformed.
+  loop: "{{ gluetun_running_container_inspect_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Record running containers sharing the Gluetun network namespace
+  vars:
+    gluetun_running_container_inspect_fields: "{{ item.stdout.split('|') }}"
+    gluetun_running_container_namespace_reference: >-
+      {{
+        gluetun_running_container_inspect_fields[2]
+        | regex_replace('^container:', '')
+      }}
+  ansible.builtin.set_fact:
+    gluetun_running_namespace_consumers_list: >-
+      {{
+        gluetun_running_namespace_consumers_list
+        + [
+          {
+            'container_id': gluetun_running_container_inspect_fields[0],
+            'container_name': gluetun_running_container_inspect_fields[4]
+          }
+        ]
+      }}
+  when:
+    - gluetun_existing_owner_container_id | length > 0
+    - gluetun_running_container_inspect_fields[0] != gluetun_existing_owner_container_id
+    - >-
+      (
+        gluetun_running_container_inspect_fields[2]
+        == 'container:' + gluetun_existing_owner_container_id
+      )
+      or
+      (
+        gluetun_running_container_inspect_fields[2]
+        == 'container:' + gluetun_identifier
+      )
+      or
+      (
+        gluetun_running_container_inspect_fields[2].startswith('container:')
+        and gluetun_running_container_namespace_reference | length >= 12
+        and gluetun_existing_owner_container_id.startswith(gluetun_running_container_namespace_reference)
+      )
+      or
+      (
+        gluetun_existing_owner_sandbox_id | length > 0
+        and gluetun_running_container_inspect_fields[3]
+        == gluetun_existing_owner_sandbox_id
+      )
+  loop: "{{ gluetun_running_container_inspect_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Enforce the one-owner one-consumer namespace registry
+  ansible.builtin.assert:
+    that:
+      - gluetun_running_namespace_consumers_list | length <= 1
+      - >-
+        gluetun_running_namespace_consumers_list
+        | map(attribute='container_id')
+        | difference(gluetun_configured_consumer_container_ids_list)
+        | length == 0
+    fail_msg: >-
+      An unknown or additional running container shares the current Gluetun
+      network namespace; refusing to mutate the owner.
 
 - name: Ensure Gluetun paths exist
   ansible.builtin.file:
@@ -243,97 +672,169 @@
   until: gluetun_container_image_pull_result_command is not failed
   changed_when: "'Downloaded newer image' in gluetun_container_image_pull_result_command.stdout"
 
-- name: Inspect an existing Gluetun container network
+- name: Initialize Gluetun network identity
+  ansible.builtin.set_fact:
+    gluetun_existing_network_id: ""
+
+- name: Query the exact Gluetun container network name
   ansible.builtin.command:
     cmd: >-
-      {{ devture_systemd_docker_base_host_command_docker }} network inspect
-      {{ gluetun_container_network }}
-  register: gluetun_existing_network_inspect_result
+      {{ devture_systemd_docker_base_host_command_docker }}
+      network ls --no-trunc --quiet
+      --filter 'name=^{{ gluetun_container_network | regex_escape }}$'
+  register: gluetun_existing_network_query_result
   changed_when: false
-  failed_when: false
 
-- name: Validate an existing Gluetun container network before reuse
-  when: gluetun_existing_network_inspect_result.rc == 0
-  vars:
-    gluetun_existing_network_inspection: "{{ gluetun_existing_network_inspect_result.stdout | from_json | first }}"
-    gluetun_existing_network_endpoint_names: >-
-      {{
-        gluetun_existing_network_inspection.Containers
-        | default({}, true)
-        | dict2items
-        | map(attribute='value.Name')
-        | list
-      }}
+- name: Validate the exact Gluetun container network query
   ansible.builtin.assert:
     that:
-      - gluetun_existing_network_inspection.Name == gluetun_container_network
-      - gluetun_existing_network_inspection.Driver == 'bridge'
-      - not gluetun_existing_network_inspection.EnableIPv6 | default(false) | bool
       - >-
-        gluetun_existing_network_endpoint_names
+        gluetun_existing_network_query_result.stdout | trim | length == 0
+        or
+        (
+          gluetun_existing_network_query_result.stdout_lines | length == 1
+          and
+          gluetun_existing_network_query_result.stdout_lines[0]
+          is match('^[a-f0-9]{64}$')
+        )
+    fail_msg: The exact Gluetun network query returned an ambiguous identity.
+
+- name: Record the existing Gluetun container network ID
+  ansible.builtin.set_fact:
+    gluetun_existing_network_id: "{{ gluetun_existing_network_query_result.stdout_lines[0] }}"
+  when: gluetun_existing_network_query_result.stdout_lines | length == 1
+
+- name: Inspect existing Gluetun container network metadata by exact ID
+  when: gluetun_existing_network_id | length > 0
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      network inspect
+      --format='{% raw %}{{.Id}}|{{.Name}}|{{.Driver}}|{{.EnableIPv6}}|{{index .Labels "io.mash.gluetun.owner"}}{% endraw %}'
+      {{ gluetun_existing_network_id }}
+  register: gluetun_existing_network_metadata_result
+  changed_when: false
+
+- name: Inspect existing Gluetun container network endpoints by exact ID
+  when: gluetun_existing_network_id | length > 0
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      network inspect
+      --format='{% raw %}{{range .Containers}}{{println .Name}}{{end}}{% endraw %}'
+      {{ gluetun_existing_network_id }}
+  register: gluetun_existing_network_endpoints_result
+  changed_when: false
+
+- name: Validate an existing owned Gluetun container network before reuse
+  when: gluetun_existing_network_id | length > 0
+  vars:
+    gluetun_existing_network_metadata_fields: "{{ gluetun_existing_network_metadata_result.stdout.split('|') }}"
+  ansible.builtin.assert:
+    that:
+      - gluetun_existing_network_metadata_fields | length == 5
+      - gluetun_existing_network_metadata_fields[0] == gluetun_existing_network_id
+      - gluetun_existing_network_metadata_fields[1] == gluetun_container_network
+      - gluetun_existing_network_metadata_fields[2] == 'bridge'
+      - gluetun_existing_network_metadata_fields[3] == 'false'
+      - >-
+        gluetun_existing_network_metadata_fields[4]
+        == gluetun_container_network_owner_label_value
+      - >-
+        gluetun_existing_network_endpoints_result.stdout_lines
         | difference(([gluetun_identifier] + gluetun_container_network_known_peer_containers_list) | unique)
         | length == 0
     fail_msg: >-
-      The existing Gluetun network is not the dedicated IPv4-only bridge
-      expected by this role, or it has an unknown attached endpoint.
+      Refusing to adopt an existing network without the exact Gluetun owner
+      label, IPv4-only bridge settings, and endpoint allowlist.
 
 - name: Ensure Gluetun container network is created via community.docker.docker_network
   when:
-    - gluetun_existing_network_inspect_result.rc != 0
+    - gluetun_existing_network_id | length == 0
     - devture_systemd_docker_base_container_network_creation_method == 'ansible-module'
   community.docker.docker_network:
     enable_ipv6: false
     name: "{{ gluetun_container_network }}"
     driver: bridge
     driver_options: "{{ devture_systemd_docker_base_container_networks_driver_options }}"
+    labels:
+      io.mash.gluetun.owner: "{{ gluetun_container_network_owner_label_value }}"
   register: gluetun_network_creation_result_ansible_module
 
 - name: Ensure Gluetun container network is created via ansible.builtin.command
   when:
-    - gluetun_existing_network_inspect_result.rc != 0
+    - gluetun_existing_network_id | length == 0
     - devture_systemd_docker_base_container_network_creation_method == 'command'
   ansible.builtin.command:
     cmd: >-
       {{ devture_systemd_docker_base_host_command_docker }} network create
+      --driver=bridge
+      --label={{ gluetun_container_network_owner_label }}={{ gluetun_container_network_owner_label_value }}
       {{ devture_systemd_docker_base_container_networks_driver_options_string }}
       {{ gluetun_container_network }}
   register: gluetun_network_creation_result_command
   changed_when: gluetun_network_creation_result_command.rc == 0
-  failed_when: >-
-    gluetun_network_creation_result_command.rc != 0
-    and 'already exists' not in gluetun_network_creation_result_command.stderr
 
-- name: Inspect the installed Gluetun container network
+- name: Query the installed Gluetun container network identity
   ansible.builtin.command:
     cmd: >-
-      {{ devture_systemd_docker_base_host_command_docker }} network inspect
-      {{ gluetun_container_network }}
-  register: gluetun_installed_network_inspect_result
+      {{ devture_systemd_docker_base_host_command_docker }}
+      network ls --no-trunc --quiet
+      --filter 'name=^{{ gluetun_container_network | regex_escape }}$'
+  register: gluetun_installed_network_query_result
   changed_when: false
 
-- name: Validate the installed Gluetun container network
-  vars:
-    gluetun_installed_network_inspection: "{{ gluetun_installed_network_inspect_result.stdout | from_json | first }}"
-    gluetun_installed_network_endpoint_names: >-
-      {{
-        gluetun_installed_network_inspection.Containers
-        | default({}, true)
-        | dict2items
-        | map(attribute='value.Name')
-        | list
-      }}
+- name: Require one exact installed Gluetun container network identity
   ansible.builtin.assert:
     that:
-      - gluetun_installed_network_inspection.Name == gluetun_container_network
-      - gluetun_installed_network_inspection.Driver == 'bridge'
-      - not gluetun_installed_network_inspection.EnableIPv6 | default(false) | bool
+      - gluetun_installed_network_query_result.stdout_lines | length == 1
+      - gluetun_installed_network_query_result.stdout_lines[0] is match('^[a-f0-9]{64}$')
+    fail_msg: The installed Gluetun network does not have one exact identity.
+
+- name: Record the installed Gluetun container network identity
+  ansible.builtin.set_fact:
+    gluetun_installed_network_id: "{{ gluetun_installed_network_query_result.stdout_lines[0] }}"
+
+- name: Inspect installed Gluetun container network metadata by exact ID
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      network inspect
+      --format='{% raw %}{{.Id}}|{{.Name}}|{{.Driver}}|{{.EnableIPv6}}|{{index .Labels "io.mash.gluetun.owner"}}{% endraw %}'
+      {{ gluetun_installed_network_id }}
+  register: gluetun_installed_network_metadata_result
+  changed_when: false
+
+- name: Inspect installed Gluetun container network endpoints by exact ID
+  ansible.builtin.command:
+    cmd: >-
+      {{ devture_systemd_docker_base_host_command_docker }}
+      network inspect
+      --format='{% raw %}{{range .Containers}}{{println .Name}}{{end}}{% endraw %}'
+      {{ gluetun_installed_network_id }}
+  register: gluetun_installed_network_endpoints_result
+  changed_when: false
+
+- name: Validate the installed owned Gluetun container network
+  vars:
+    gluetun_installed_network_metadata_fields: "{{ gluetun_installed_network_metadata_result.stdout.split('|') }}"
+  ansible.builtin.assert:
+    that:
+      - gluetun_installed_network_metadata_fields | length == 5
+      - gluetun_installed_network_metadata_fields[0] == gluetun_installed_network_id
+      - gluetun_installed_network_metadata_fields[1] == gluetun_container_network
+      - gluetun_installed_network_metadata_fields[2] == 'bridge'
+      - gluetun_installed_network_metadata_fields[3] == 'false'
       - >-
-        gluetun_installed_network_endpoint_names
+        gluetun_installed_network_metadata_fields[4]
+        == gluetun_container_network_owner_label_value
+      - >-
+        gluetun_installed_network_endpoints_result.stdout_lines
         | difference(([gluetun_identifier] + gluetun_container_network_known_peer_containers_list) | unique)
         | length == 0
     fail_msg: >-
-      The installed Gluetun network is not the dedicated IPv4-only bridge
-      expected by this role, or it has an unknown attached endpoint.
+      The installed network does not satisfy the owned, dedicated IPv4-only
+      Gluetun bridge and endpoint contract.
 
 - name: Ensure Gluetun systemd service is present
   ansible.builtin.template:

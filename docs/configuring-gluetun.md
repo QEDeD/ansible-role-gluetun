@@ -66,7 +66,8 @@ cannot be injected through this mapping.
 
 The protected service must:
 
-1. use `--network=container:<gluetun-container-name-or-id>`;
+1. resolve the current Gluetun owner and use
+   `--network=container:<full-gluetun-container-ID>`;
 2. have no own Docker network, additional networks or published ports;
 3. omit Docker options incompatible with container networking, including
    `--hostname` and `--dns`;
@@ -74,8 +75,21 @@ The protected service must:
    `/etc/resolv.conf`;
 5. require and order itself after the Gluetun systemd unit;
 6. verify the current owner container is healthy before creation;
-7. stop when the owner unit stops and recreate after the owner container ID
-   changes.
+7. resolve and use the owner's full container ID at runtime, rather than
+   trusting a mutable owner name;
+8. stop when the owner unit stops and recreate after the owner container ID
+   changes;
+9. include these exact unit contract lines:
+
+   ```systemd
+   BindsTo=gluetun.service
+   After=gluetun.service
+   # MASH-NetworkNamespaceOwner=gluetun
+   # MASH-NetworkNamespaceIdentity=resolved-full-container-id
+   ```
+
+The identity marker is literal capability metadata. It asserts that the unit
+uses the runtime exact-ID resolver; it is not replaced with an ID.
 
 The generated resolver contains only:
 
@@ -95,6 +109,10 @@ gluetun_protected_consumers_list:
     container_name: qbittorrent
 ```
 
+Docker container and network names used by this contract cannot consist only
+of lowercase hexadecimal characters, because Docker also accepts bare
+hexadecimal prefixes as object IDs.
+
 The Gluetun unit derives its `Wants=` relationships from this list. The
 consumer-side `BindsTo=` and `After=` relationship provides ordering and stop
 coupling, including unexpected owner failure.
@@ -102,21 +120,33 @@ coupling, including unexpected owner failure.
 ## Integrator sequencing
 
 This role runs an isolation gate before changing paths, images, networks or
-units. It queries the Docker daemon for the current full owner ID and each
-configured protected consumer. A consumer is preserved only if it is absent,
-stopped, or its exact network mode is `container:<current-owner-ID>`. Any
-running standalone or stale-owner consumer has both its configured systemd
-unit and named container stopped, and the role proves that it is no longer
-running before proceeding.
+units. It resolves exact names to full IDs, then inspects those immutable IDs.
+A consumer is preserved only if it is absent, stopped, or its exact network
+mode is `container:<current-owner-ID>` and that exact owner is running. Any
+running standalone, renamed, stale-owner, or stopped-owner consumer has its
+configured systemd unit, declared name, and resolved ID stopped. The role
+proves the unit inactive and both the original ID and current exact name no
+longer running before proceeding.
 
-Docker query or inspection errors fail the gate; they are never interpreted as
-container absence. This makes fresh migration safe even if later owner setup
-fails, while an idempotent run does not interrupt a consumer already attached
-to the current owner.
+Docker query or inspection uncertainty first triggers conservative consumer
+isolation and only then fails the run. Errors are never interpreted as
+container absence. An idempotent run does not interrupt a positively verified
+consumer already attached to the exact current owner ID.
 
-For MASH qBittorrent integration, keep normal setup order:
-Gluetun first, then qBittorrent. The qBittorrent role can then require the
-owner to exist and migrate or recreate the consumer against its exact ID.
+The owner container carries a fixed role-owned label. A same-name container
+without the exact label is not adopted or removed: configured consumers are
+isolated first and the run then refuses further owner mutation.
+
+The qBittorrent or other consumer role must render this safe unit before the
+Gluetun role renders its reverse `Wants=` relationship. Service-manager
+priority remains owner first and consumer second: `Wants=` pulls the consumer
+in, while its `After=` waits for the owner's health-gated start job.
+
+When a current owner exists, the role also inventories all running Docker
+containers and compares their actual network sandbox and `container:` network
+mode. It rejects unknown or multiple namespace consumers. Such namespace
+consumers are not Docker bridge endpoints and therefore require this separate
+registry check.
 
 ## Dedicated bridge and Traefik
 
@@ -129,24 +159,30 @@ available for diagnostics while Internet egress is blocked:
 ```yaml
 gluetun_container_network_known_peer_containers_list:
   - traefik
-gluetun_firewall_input_ports:
-  - 8080  # qBittorrent Web UI
 ```
 
 The Traefik role or playbook integration owns attachment. This role does not
 attach peers during installation. The dedicated bridge must contain only
-Gluetun and explicitly configured proxy peers.
+Gluetun and explicitly configured proxy peers. The bridge carries a
+role-owned label; an existing unlabelled or differently labelled network is
+never adopted or removed.
 
-`gluetun_firewall_input_ports` is a deliberate, numeric allowlist for local
-ingress from that bridge. It does not permit Internet egress, VPN-side ingress,
-or access to arbitrary outbound subnets. Configure only the protected
-service's diagnostic port. The role rejects duplicates, ports outside
-`1..65535`, and collisions with Gluetun's DNS, control and health listeners.
+Pinned Gluetun v3.41.2 automatically accepts INPUT from every detected local
+subnet. `gluetun_firewall_input_ports` is therefore fixed empty and is not an
+effective per-port diagnostic boundary. The dedicated bridge, exact endpoint
+allowlist, and approved Traefik peer are the local diagnostic trust boundary:
+the host bridge gateway and Traefik may reach every namespace listener bound
+to the bridge address. No host ports are published, and this local reachability
+does not permit protected-service Internet egress. Gluetun's DNS, health and
+control listeners remain bound to loopback.
 
 On uninstall, the role disconnects only explicitly listed known peers. It
 never force-disconnects unknown endpoints. If an unknown endpoint remains,
 network deletion does not converge and the role retains the network with a
-runtime warning.
+runtime warning. It also refuses to remove the owner while any unconfigured
+running namespace consumer remains, and it independently stops, removes, and
+proves both the stable owner name and originally resolved owner ID absent even
+if the systemd unit is missing or its cleanup command failed.
 
 ## Failure behaviour
 

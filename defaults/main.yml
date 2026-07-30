@@ -30,6 +30,10 @@ gluetun_container_image_registry_prefix_upstream: "{{ gluetun_container_image_re
 gluetun_container_image_registry_prefix_upstream_default: docker.io/
 
 gluetun_container_hostname: "{{ gluetun_identifier }}"
+# A same-name container is trusted for adoption or cleanup only with this
+# immutable role-owned label.
+gluetun_container_owner_label: io.mash.gluetun.owner
+gluetun_container_owner_label_value: "{{ gluetun_identifier }}"
 
 # Gluetun owns one dedicated, IPv4-only bridge. Protected containers share
 # Gluetun's network namespace and must not be attached to this or any other
@@ -37,6 +41,10 @@ gluetun_container_hostname: "{{ gluetun_identifier }}"
 gluetun_container_network: "{{ gluetun_identifier }}"
 gluetun_container_network_ipv6_enabled: false
 gluetun_container_network_deletion_enabled: true
+# This role-owned label is required before an existing network can be adopted
+# or removed, preventing same-name networks from becoming cleanup targets.
+gluetun_container_network_owner_label: io.mash.gluetun.owner
+gluetun_container_network_owner_label_value: "{{ gluetun_identifier }}"
 
 # Containers in this list are known peers, such as Traefik, which another role
 # has attached to gluetun_container_network. During uninstall, only these
@@ -177,6 +185,8 @@ gluetun_dns_upstream_resolver_names_allowed:
   - quad9 unsecured
   - quadrant
 
+# These non-local targets are fixed by validation so health cannot be weakened
+# into a loopback/LAN-only readiness signal.
 gluetun_health_target_addresses:
   - cloudflare.com:443
   - github.com:443
@@ -189,6 +199,9 @@ gluetun_container_health_poll_interval_seconds: 2
 # These settings form part of the enforced contract. Validation rejects
 # attempts to weaken them.
 gluetun_firewall_enabled: true
+# Gluetun v3.41.2 independently accepts detected local subnets. This variable
+# is role-owned empty; the dedicated bridge/peer registry is the local trust
+# boundary, not a per-port FIREWALL_INPUT_PORTS allowlist.
 gluetun_firewall_input_ports: []
 gluetun_firewall_vpn_input_ports: []
 gluetun_firewall_outbound_subnets: []
@@ -208,8 +221,8 @@ gluetun_environment_variables_tz: Etc/UTC
 
 # The owner-side migration gate checks these consumers before any installation
 # mutation. A running consumer is preserved only when it already shares the
-# exact current owner container ID; otherwise its unit and container are
-# stopped and the stopped state is verified.
+# exact current, running owner container ID; otherwise its unit and container
+# are stopped and the stopped state is verified.
 gluetun_protected_consumers_list: []
 
 # Derived, role-owned list used by the owner unit's Wants= relationships and
@@ -232,18 +245,24 @@ gluetun_systemd_wanted_services_list_auto: []
 gluetun_systemd_wanted_services_list_custom: []
 
 gluetun_container_stop_grace_time_seconds: "{{ [devture_systemd_docker_base_container_stop_grace_time_seconds, 10] | max }}"
-gluetun_container_cleanup_timeout_seconds: "{{ devture_systemd_docker_base_container_cleanup_timeout_seconds }}"
+gluetun_container_cleanup_attempts: "{{ devture_systemd_docker_base_container_cleanup_timeout_seconds }}"
 gluetun_container_cleanup_retry_delay_seconds: "{{ devture_systemd_docker_base_container_cleanup_retry_delay_seconds }}"
+gluetun_systemd_start_timeout_margin_seconds: 60
+# Worst-case cleanup attempts plus the health gate and explicit startup margin.
 gluetun_systemd_start_timeout_seconds: >-
   {{
-    (gluetun_container_cleanup_timeout_seconds | int)
+    (gluetun_container_cleanup_attempts | int)
+    * (
+      (gluetun_container_stop_grace_time_seconds | int)
+      + (gluetun_container_cleanup_retry_delay_seconds | int)
+    )
     + (gluetun_container_health_startup_timeout_seconds | int)
-    + 60
+    + (gluetun_systemd_start_timeout_margin_seconds | int)
   }}
 
 gluetun_container_cleanup_command: |
   i=0;
-  while [ "$i" -lt {{ gluetun_container_cleanup_timeout_seconds }} ]; do
+  while [ "$i" -lt {{ gluetun_container_cleanup_attempts }} ]; do
   {{ devture_systemd_docker_base_host_command_docker }} stop -t {{ gluetun_container_stop_grace_time_seconds }} {{ gluetun_identifier }} >/dev/null 2>&1 || true;
   {{ devture_systemd_docker_base_host_command_docker }} rm -f {{ gluetun_identifier }} >/dev/null 2>&1 || true;
   if {{ devture_systemd_docker_base_host_command_docker }} container inspect {{ gluetun_identifier }} >/dev/null 2>&1; then
@@ -257,7 +276,7 @@ gluetun_container_cleanup_command: |
   echo "Failed to query Docker daemon while cleaning up {{ gluetun_identifier }}" >&2;
   exit 1;
   done;
-  echo "Failed to remove stale container {{ gluetun_identifier }} after {{ gluetun_container_cleanup_timeout_seconds }} attempts" >&2;
+  echo "Failed to remove stale container {{ gluetun_identifier }} after {{ gluetun_container_cleanup_attempts }} attempts" >&2;
   exit 1
 
 gluetun_restart_necessary: false
